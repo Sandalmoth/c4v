@@ -19,7 +19,15 @@ const Value = union(ValueType) {
 };
 
 const Interpreter = struct {
-    const nil = Value{ .nil = {} };
+    const Primitive = struct {
+        name: []const u8,
+        function: *const (fn (*Interpreter, Value, Value) Value),
+    };
+    const primitives: [3]Primitive = .{
+        .{ .name = "car", .function = &f_car },
+        .{ .name = "cdr", .function = &f_cdr },
+        .{ .name = "quote", .function = &f_quote },
+    };
 
     alloc: std.mem.Allocator,
 
@@ -28,6 +36,11 @@ const Interpreter = struct {
     stack: []Value,
     heap: [*:0]u8, // actually just &stack[0], stores null terminated strings
 
+    nil: Value,
+    tru: Value,
+    err: Value,
+    env: Value,
+
     pub fn init(alloc: std.mem.Allocator, config: Config) !Interpreter {
         var ipt = Interpreter{
             .alloc = alloc,
@@ -35,14 +48,74 @@ const Interpreter = struct {
             .hp = 0,
             .stack = try alloc.alloc(Value, config.stack_size),
             .heap = undefined,
+            .nil = undefined,
+            .tru = undefined,
+            .err = undefined,
+            .env = undefined,
         };
         ipt.heap = @ptrCast(ipt.stack.ptr);
+
+        ipt.nil = Value{ .nil = {} };
+        ipt.tru = ipt.atom("#t");
+        ipt.err = ipt.atom("ERR");
+        ipt.env = ipt.cons(ipt.cons(ipt.tru, ipt.tru), ipt.nil);
+
+        for (primitives, 0..) |p, i| {
+            ipt.env = ipt.cons(ipt.cons(
+                ipt.atom(p.name),
+                Value{ .primitive = @intCast(i) },
+            ), ipt.env);
+        }
+
         return ipt;
     }
 
     pub fn deinit(ipt: *Interpreter) void {
         ipt.alloc.free(ipt.stack);
         ipt.* = undefined;
+    }
+
+    pub fn read(ipt: *Interpreter, src: []const u8) Value {
+        var ctx: ScannerContext = .{ .src = src };
+        scan(&ctx);
+        return ipt.parse(&ctx);
+    }
+
+    // pub fn eval(ipt: *Interpreter, x: Value, env: Value) Value {
+    //     return switch (x) {
+    //         .atom => ipt.assoc(x, env),
+    //         .cons => ipt.apply(ipt.eval(ipt.car(x), env), ipt.cdr(x), env),
+    //         else => x,
+    //     };
+    // }
+
+    pub fn step(ipt: *Interpreter, x: Value, env: Value) Value {
+        return switch (x) {
+            .atom => ipt.assoc(x, env),
+            .cons => ipt.apply(ipt.eval(ipt.car(x), env), ipt.cdr(x), env),
+            else => x,
+        };
+    }
+
+    pub fn eval(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.step(x, env);
+        std.debug.print("{}:\t", .{ipt.sp});
+        ipt.print(x);
+        std.debug.print(" => ", .{});
+        ipt.print(y);
+        std.debug.print("\n", .{});
+        return y;
+    }
+
+    pub fn print(ipt: *Interpreter, val: Value) void {
+        switch (val) {
+            .nil => std.debug.print("()", .{}),
+            .atom => |offset| std.debug.print("{s}", .{ipt.heapStr(offset)}),
+            .primitive => |p| std.debug.print("<{s}>", .{primitives[p].name}),
+            .cons => ipt.printlist(val),
+            .number => |n| std.debug.print("{}", .{n}),
+            else => @panic("unprintable"),
+        }
     }
 
     inline fn heapStr(ipt: *Interpreter, offset: u32) []u8 {
@@ -66,7 +139,7 @@ const Interpreter = struct {
             ipt.hp += @intCast(token.len);
             ipt.heap[ipt.hp] = 0; // null terminator
             ipt.hp += 1;
-            if (ipt.hp > ipt.sp / @sizeOf(Value)) {
+            if (ipt.hp > ipt.sp * @sizeOf(Value)) {
                 @panic("interpreter out of memory");
             }
         }
@@ -78,24 +151,67 @@ const Interpreter = struct {
         ipt.stack[ipt.sp - 1] = a;
         ipt.stack[ipt.sp - 2] = d;
         ipt.sp -= 2;
-        if (ipt.hp > ipt.sp / @sizeOf(Value)) {
+        if (ipt.hp > ipt.sp * @sizeOf(Value)) {
             @panic("interpreter out of memory");
         }
         return .{ .cons = ipt.sp };
     }
 
     fn car(ipt: *Interpreter, c: Value) Value {
-        switch (c) {
-            .cons, .closure => |a| return ipt.stack[a + 1],
-            else => @panic("car must be called on a cons or a closure"),
-        }
+        return switch (c) {
+            .cons, .closure => |a| ipt.stack[a + 1],
+            else => ipt.err,
+        };
     }
 
     fn cdr(ipt: *Interpreter, c: Value) Value {
-        switch (c) {
-            .cons, .closure => |d| return ipt.stack[d],
-            else => @panic("car must be called on a cons or a closure"),
+        return switch (c) {
+            .cons, .closure => |d| ipt.stack[d],
+            else => ipt.err,
+        };
+    }
+
+    fn assoc(ipt: *Interpreter, x: Value, _env: Value) Value {
+        // so the definitions in an environment are a series of pairs like
+        // ((name definition) ((name definition) (...)))
+        // so we walk down the cdr, checking the car each time for a match
+        var env = _env;
+        while (env == .cons and !std.meta.eql(x, ipt.car(ipt.car(env)))) {
+            env = ipt.cdr(env);
         }
+        if (env == .cons) {
+            // we found something before the end of the environment
+            return ipt.cdr(ipt.car(env));
+        }
+        std.debug.print("{} not in environment {}\n", .{ x, env });
+        return ipt.err;
+    }
+
+    fn reduce(ipt: *Interpreter, clos: Value, x: Value, env: Value) Value {
+        _ = ipt;
+        _ = clos;
+        _ = x;
+        _ = env;
+        @panic("closures are not implemented");
+    }
+
+    fn apply(ipt: *Interpreter, clos: Value, x: Value, env: Value) Value {
+        return switch (clos) {
+            .primitive => |p| primitives[p].function(ipt, x, env),
+            .closure => ipt.reduce(clos, x, env),
+            else => ipt.err,
+        };
+    }
+
+    fn evlis(ipt: *Interpreter, x: Value, env: Value) Value {
+        return switch (x) {
+            .cons => ipt.cons(
+                ipt.eval(ipt.car(x), env),
+                ipt.evlis(ipt.cdr(x), env),
+            ),
+            .atom => ipt.assoc(x, env),
+            else => ipt.nil,
+        };
     }
 
     const ScannerContext = struct {
@@ -132,7 +248,7 @@ const Interpreter = struct {
     fn list(ipt: *Interpreter, ctx: *ScannerContext) Value {
         scan(ctx);
         if (ctx.token[0] == ')') {
-            return nil;
+            return ipt.nil;
         }
 
         if (ctx.token[0] == '.') {
@@ -151,7 +267,7 @@ const Interpreter = struct {
         if (ctx.token[0] == '(') {
             return ipt.list(ctx);
         } else if (ctx.token[0] == '\'') {
-            return ipt.cons(ipt.atom("quote"), ipt.cons(ipt.read(ctx.src[ctx.cursor..]), nil));
+            return ipt.cons(ipt.atom("quote"), ipt.cons(ipt.read(ctx.src[ctx.cursor..]), ipt.nil));
         } else {
             // TODO strings
             const number = std.fmt.parseFloat(f64, ctx.token) catch {
@@ -162,22 +278,6 @@ const Interpreter = struct {
         }
 
         unreachable;
-    }
-
-    pub fn read(ipt: *Interpreter, src: []const u8) Value {
-        var ctx: ScannerContext = .{ .src = src };
-        scan(&ctx);
-        return ipt.parse(&ctx);
-    }
-
-    pub fn print(ipt: *Interpreter, val: Value) void {
-        switch (val) {
-            .nil => std.debug.print("()", .{}),
-            .atom => |offset| std.debug.print("{s}", .{ipt.heapStr(offset)}),
-            .cons => ipt.printlist(val),
-            .number => |n| std.debug.print("{}", .{n}),
-            else => @panic("unprintable"),
-        }
     }
 
     fn printlist(ipt: *Interpreter, _l: Value) void {
@@ -198,6 +298,19 @@ const Interpreter = struct {
         }
         std.debug.print(")", .{});
     }
+
+    fn f_car(ipt: *Interpreter, x: Value, env: Value) Value {
+        return ipt.car(ipt.car(ipt.evlis(x, env)));
+    }
+
+    fn f_cdr(ipt: *Interpreter, x: Value, env: Value) Value {
+        return ipt.cdr(ipt.car(ipt.evlis(x, env)));
+    }
+
+    fn f_quote(ipt: *Interpreter, x: Value, env: Value) Value {
+        _ = env;
+        return ipt.car(x);
+    }
 };
 
 test "read" {
@@ -208,11 +321,31 @@ test "read" {
 
     ipt.print(ipt.read("(+ 1 2)"));
     std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(+ 1 2)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.read("'(1 2)"));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("'(1 2)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.read("(car (1 2))"));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(car '(1 2))"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.read("(cdr (1 2))"));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(cdr '(1 2))"), ipt.env));
+    std.debug.print("\n", .{});
 
     ipt.print(ipt.read("(3 . 4)"));
     std.debug.print("\n", .{});
 
     ipt.print(ipt.read("(lambda (x) (* x x))"));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.read("(count '(1 1 1 1 1))"));
     std.debug.print("\n", .{});
 
     // _ = ipt.read("(+ 1 2)");
