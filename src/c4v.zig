@@ -21,7 +21,7 @@ const Interpreter = struct {
         name: []const u8,
         function: *const (fn (*Interpreter, Value, Value) Value),
     };
-    const primitives: [18]Primitive = .{
+    const primitives: [20]Primitive = .{
         .{ .name = "eval", .function = &f_eval },
         .{ .name = "quote", .function = &f_quote },
         .{ .name = "cons", .function = &f_cons },
@@ -39,6 +39,8 @@ const Interpreter = struct {
         .{ .name = "and", .function = &f_and },
         .{ .name = "cond", .function = &f_cond },
         .{ .name = "if", .function = &f_if },
+        .{ .name = "let", .function = &f_let },
+        .{ .name = "lambda", .function = &f_lambda },
         .{ .name = "define", .function = &f_define },
     };
 
@@ -127,7 +129,8 @@ const Interpreter = struct {
             .primitive => |p| std.debug.print("<{s}>", .{primitives[p].name}),
             .cons => ipt.printlist(val),
             .number => |n| std.debug.print("{}", .{n}),
-            else => @panic("unprintable"),
+            .closure => |c| std.debug.print("λ{}", .{c}),
+            // else => @panic("unprintable"),
         }
     }
 
@@ -184,6 +187,18 @@ const Interpreter = struct {
         };
     }
 
+    fn closure(ipt: *Interpreter, x: Value, y: Value, env: Value) Value {
+        // so, if we are in not in the global environment
+        // we add the closure to the given environment,
+        // otherwise we just let it be
+        return Value{
+            .closure = if (std.meta.eql(ipt.env, env))
+                ipt.cons(ipt.cons(x, y), ipt.nil).cons
+            else
+                ipt.cons(ipt.cons(x, y), env).cons,
+        };
+    }
+
     fn assoc(ipt: *Interpreter, x: Value, _env: Value) Value {
         // so the definitions in an environment are a series of pairs like
         // ((name definition) ((name definition) (...)))
@@ -200,12 +215,26 @@ const Interpreter = struct {
         return ipt.err;
     }
 
+    fn bind(ipt: *Interpreter, x: Value, y: Value, env: Value) Value {
+        // so x is a list and y is a list
+        // so take the first of each and add them to an environment
+        return switch (x) {
+            .nil => env,
+            .cons => ipt.bind(ipt.cdr(x), ipt.cdr(y), ipt.cons(
+                ipt.cons(ipt.car(x), ipt.car(y)),
+                env,
+            )),
+            else => ipt.cons(ipt.cons(x, y), env),
+        };
+    }
+
     fn reduce(ipt: *Interpreter, clos: Value, x: Value, env: Value) Value {
-        _ = ipt;
-        _ = clos;
-        _ = x;
-        _ = env;
-        @panic("closures are not implemented");
+        return ipt.eval(ipt.cdr(ipt.car(clos)), ipt.bind(
+            ipt.car(ipt.car(clos)),
+            ipt.evlis(x, env),
+
+            if (ipt.cdr(clos) == .nil) ipt.env else ipt.cdr(clos),
+        ));
     }
 
     fn apply(ipt: *Interpreter, clos: Value, x: Value, env: Value) Value {
@@ -498,8 +527,23 @@ const Interpreter = struct {
             ipt.eval(ipt.car(ipt.cdr(x)), env);
     }
 
-    // fn f_(ipt: *Interpreter, x: Value, env: Value) Value {}
-    // fn f_(ipt: *Interpreter, x: Value, env: Value) Value {}
+    fn f_let(ipt: *Interpreter, _x: Value, _env: Value) Value {
+        // walk a list of kv pairs
+        // and add them all to the environment
+        var x = _x;
+        var env = _env;
+        while (x != .nil and ipt.cdr(x) != .nil) : (x = ipt.cdr(x)) {
+            env = ipt.cons(ipt.cons(
+                ipt.car(ipt.car(x)),
+                ipt.eval(ipt.car(ipt.cdr(ipt.car(x))), env),
+            ), env);
+        }
+        return ipt.eval(ipt.car(x), env);
+    }
+
+    fn f_lambda(ipt: *Interpreter, x: Value, env: Value) Value {
+        return ipt.closure(ipt.car(x), ipt.car(ipt.cdr(x)), env);
+    }
 
     fn f_define(ipt: *Interpreter, x: Value, env: Value) Value {
         ipt.env = ipt.cons(ipt.cons(
@@ -534,5 +578,24 @@ test "read" {
     ipt.print(ipt.eval(ipt.read("(define my-var 3)"), ipt.env));
     std.debug.print("\n", .{});
     ipt.print(ipt.eval(ipt.read("(+ my-var 2)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.eval(ipt.read("(define sq (lambda (x) (* x x)))"), ipt.env));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(sq 3)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.eval(ipt.read("'(define  my-var 2)"), ipt.env));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(+ my-var 2)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    // this seems like a bug though, like, shouldn't the quote ignore the define
+    ipt.print(ipt.eval(ipt.read("(car '(define  my-var 2))"), ipt.env));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(+ my-var 2)"), ipt.env));
+    std.debug.print("\n", .{});
+
+    ipt.print(ipt.eval(ipt.read("(let (a 2) (b 3) (+ (sq a) b))"), ipt.env));
     std.debug.print("\n", .{});
 }
