@@ -6,15 +6,13 @@ const Config = struct {
     stack_size: u32 = 1024,
 };
 
-const ValueType = enum { number, atom, string, primitive, cons, closure, false, nil };
+const ValueType = enum { number, atom, primitive, cons, closure, nil };
 const Value = union(ValueType) {
     number: f64,
     atom: u32, // heap offset to first byte (interned, null terminated)
-    string: u32, // heap offset to first byte (null terminated) -- do we need strings? how should they work?
     primitive: u32, // index into array of primitive functions
     cons: u32, // stack offset
     closure: u32, // stack offset
-    false: void, // if we want a separate false-type (like scheme), this is probably where to put it
     nil: void,
 };
 
@@ -23,7 +21,7 @@ const Interpreter = struct {
         name: []const u8,
         function: *const (fn (*Interpreter, Value, Value) Value),
     };
-    const primitives: [9]Primitive = .{
+    const primitives: [18]Primitive = .{
         .{ .name = "eval", .function = &f_eval },
         .{ .name = "quote", .function = &f_quote },
         .{ .name = "cons", .function = &f_cons },
@@ -33,6 +31,15 @@ const Interpreter = struct {
         .{ .name = "-", .function = &f_sub },
         .{ .name = "*", .function = &f_mul },
         .{ .name = "/", .function = &f_div },
+        .{ .name = "int", .function = &f_int },
+        .{ .name = "<", .function = &f_lt },
+        .{ .name = "=", .function = &f_eq },
+        .{ .name = "not", .function = &f_not },
+        .{ .name = "or", .function = &f_or },
+        .{ .name = "and", .function = &f_and },
+        .{ .name = "cond", .function = &f_cond },
+        .{ .name = "if", .function = &f_if },
+        .{ .name = "define", .function = &f_define },
     };
 
     alloc: std.mem.Allocator,
@@ -414,7 +421,93 @@ const Interpreter = struct {
         return n;
     }
 
+    fn f_int(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.car(ipt.evlis(x, env));
+        if (y != .number) {
+            return ipt.err;
+        }
+        const n: i64 = @intFromFloat(y.number);
+        return Value{ .number = @floatFromInt(n) };
+    }
+
+    fn f_lt(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.evlis(x, env);
+        const n = ipt.car(y);
+        const n2 = ipt.car(ipt.cdr(y));
+        if (n != .number or n2 != .number) {
+            return ipt.err;
+        }
+        return if (n.number - n2.number < 0) ipt.tru else ipt.nil;
+    }
+
+    fn f_eq(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.evlis(x, env);
+        return if (std.meta.eql(ipt.car(y), ipt.car(ipt.cdr(y)))) ipt.tru else ipt.nil;
+    }
+
+    fn f_not(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.evlis(x, env);
+        return if (ipt.car(y) == .nil) ipt.tru else ipt.nil;
+    }
+
+    fn f_or(ipt: *Interpreter, _x: Value, env: Value) Value {
+        var x = _x;
+        var y = ipt.nil;
+        while (x != .nil) {
+            y = ipt.eval(ipt.car(x), env);
+            if (y != .nil) {
+                break;
+            }
+            x = ipt.cdr(x);
+        }
+        return y;
+    }
+
+    fn f_and(ipt: *Interpreter, _x: Value, env: Value) Value {
+        var x = _x;
+        var y = ipt.nil;
+        while (x != .nil) {
+            y = ipt.eval(ipt.car(x), env);
+            if (y == .nil) {
+                break;
+            }
+            x = ipt.cdr(x);
+        }
+        return y;
+    }
+
+    fn f_cond(ipt: *Interpreter, _x: Value, env: Value) Value {
+        var x = _x;
+        // so we step through a list
+        // and evaluate an expression each step
+        // and when we find a true
+        // we break and evaluate the cdr of the cons that had that expression
+        while (x != .nil) {
+            if (ipt.eval(ipt.car(ipt.car(x)), env) != .nil) {
+                break;
+            }
+            x = ipt.cdr(x);
+        }
+        return ipt.eval(ipt.car(ipt.cdr(ipt.car(x))), env);
+    }
+
+    fn f_if(ipt: *Interpreter, x: Value, env: Value) Value {
+        return if (ipt.eval(ipt.car(x), env) != .nil)
+            ipt.eval(ipt.car(ipt.cdr(ipt.cdr(x))), env)
+        else
+            ipt.eval(ipt.car(ipt.cdr(x)), env);
+    }
+
     // fn f_(ipt: *Interpreter, x: Value, env: Value) Value {}
+    // fn f_(ipt: *Interpreter, x: Value, env: Value) Value {}
+
+    fn f_define(ipt: *Interpreter, x: Value, env: Value) Value {
+        ipt.env = ipt.cons(ipt.cons(
+            ipt.car(x),
+            ipt.eval(ipt.car(ipt.cdr(x)), env),
+        ), ipt.env);
+        return ipt.car(x);
+    }
 };
 
 test "read" {
@@ -423,58 +516,23 @@ test "read" {
     var ipt = try Interpreter.init(std.testing.allocator, .{});
     defer ipt.deinit();
 
-    ipt.print(ipt.read("(+ 1 2)"));
-    std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("(+ 1 2)"), ipt.env));
-    std.debug.print("\n", .{});
-
-    ipt.print(ipt.read("(+ 1 2 3)"));
-    std.debug.print("\n", .{});
     ipt.print(ipt.eval(ipt.read("(+ 1 2 3)"), ipt.env));
     std.debug.print("\n", .{});
 
-    ipt.print(ipt.read("'(1 2)"));
-    std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("'(1 2)"), ipt.env));
+    ipt.print(ipt.eval(ipt.read("(< 3 (/ 4 2))"), ipt.env));
     std.debug.print("\n", .{});
 
-    ipt.print(ipt.read("(car (1 2))"));
-    std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("(car '(1 . 2))"), ipt.env));
+    ipt.print(ipt.eval(ipt.read("(not (= 1 2))"), ipt.env));
     std.debug.print("\n", .{});
 
-    ipt.print(ipt.read("(cdr (1 2))"));
-    std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("(cdr '(1 . 2))"), ipt.env));
+    ipt.print(ipt.eval(ipt.read("(if (< 3 2) #t (+ 2 2))"), ipt.env));
     std.debug.print("\n", .{});
 
-    ipt.print(ipt.read("(3 . 4)"));
+    ipt.print(ipt.eval(ipt.read("(cond ((< 3 2) 1) (() 2) ((< 2 3) 3) (#t 4))"), ipt.env));
     std.debug.print("\n", .{});
 
-    ipt.print(ipt.read("(lambda (x) (* x x))"));
+    ipt.print(ipt.eval(ipt.read("(define my-var 3)"), ipt.env));
     std.debug.print("\n", .{});
-
-    ipt.print(ipt.read("(count '(1 1 1 1 1))"));
+    ipt.print(ipt.eval(ipt.read("(+ my-var 2)"), ipt.env));
     std.debug.print("\n", .{});
-
-    // _ = ipt.read("(+ 1 2)");
-    // std.debug.print("{}\n", .{ipt.atom("howdy")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("howdy")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("everybody")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("yo")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("everybody")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("howdy")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-    // std.debug.print("{}\n", .{ipt.atom("yo")});
-    // std.debug.print("{s}\n", .{ipt.heap[0..64]});
-
-    // for (ipt.heap[0..32]) |c| {
-    //     std.debug.print("{} ", .{c});
-    // }
-    // std.debug.print("\n", .{});
 }
