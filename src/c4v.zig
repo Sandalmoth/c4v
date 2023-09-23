@@ -23,10 +23,16 @@ const Interpreter = struct {
         name: []const u8,
         function: *const (fn (*Interpreter, Value, Value) Value),
     };
-    const primitives: [3]Primitive = .{
+    const primitives: [9]Primitive = .{
+        .{ .name = "eval", .function = &f_eval },
+        .{ .name = "quote", .function = &f_quote },
+        .{ .name = "cons", .function = &f_cons },
         .{ .name = "car", .function = &f_car },
         .{ .name = "cdr", .function = &f_cdr },
-        .{ .name = "quote", .function = &f_quote },
+        .{ .name = "+", .function = &f_add },
+        .{ .name = "-", .function = &f_sub },
+        .{ .name = "*", .function = &f_mul },
+        .{ .name = "/", .function = &f_div },
     };
 
     alloc: std.mem.Allocator,
@@ -183,7 +189,7 @@ const Interpreter = struct {
             // we found something before the end of the environment
             return ipt.cdr(ipt.car(env));
         }
-        std.debug.print("{} not in environment {}\n", .{ x, env });
+        std.debug.print("{} not in environment {}\n", .{ x, _env });
         return ipt.err;
     }
 
@@ -204,6 +210,10 @@ const Interpreter = struct {
     }
 
     fn evlis(ipt: *Interpreter, x: Value, env: Value) Value {
+        // there's an inefficenty here with quote
+        // as with quote, we shouldn't try to evalate the quoted term
+        // but as is, we do and then ignore it
+        // i think this could cause bugs too if it has side effects?
         return switch (x) {
             .cons => ipt.cons(
                 ipt.eval(ipt.car(x), env),
@@ -267,7 +277,10 @@ const Interpreter = struct {
         if (ctx.token[0] == '(') {
             return ipt.list(ctx);
         } else if (ctx.token[0] == '\'') {
-            return ipt.cons(ipt.atom("quote"), ipt.cons(ipt.read(ctx.src[ctx.cursor..]), ipt.nil));
+            return ipt.cons(
+                ipt.atom("quote"),
+                ipt.cons(ipt.read(ctx.src[ctx.cursor..]), ipt.nil),
+            );
         } else {
             // TODO strings
             const number = std.fmt.parseFloat(f64, ctx.token) catch {
@@ -299,6 +312,20 @@ const Interpreter = struct {
         std.debug.print(")", .{});
     }
 
+    fn f_eval(ipt: *Interpreter, x: Value, env: Value) Value {
+        return ipt.eval(ipt.car(ipt.evlis(x, env)), env);
+    }
+
+    fn f_quote(ipt: *Interpreter, x: Value, env: Value) Value {
+        _ = env;
+        return ipt.car(x);
+    }
+
+    fn f_cons(ipt: *Interpreter, x: Value, env: Value) Value {
+        const y = ipt.evlis(x, env);
+        return ipt.cons(ipt.car(y), ipt.car(ipt.cdr(y)));
+    }
+
     fn f_car(ipt: *Interpreter, x: Value, env: Value) Value {
         return ipt.car(ipt.car(ipt.evlis(x, env)));
     }
@@ -307,10 +334,87 @@ const Interpreter = struct {
         return ipt.cdr(ipt.car(ipt.evlis(x, env)));
     }
 
-    fn f_quote(ipt: *Interpreter, x: Value, env: Value) Value {
-        _ = env;
-        return ipt.car(x);
+    fn f_add(ipt: *Interpreter, x: Value, env: Value) Value {
+        var y = ipt.evlis(x, env);
+        var n = ipt.car(y);
+        if (n != .number) {
+            return ipt.err;
+        }
+        while (true) {
+            y = ipt.cdr(y);
+            if (y == .nil) {
+                break;
+            }
+            const n2 = ipt.car(y);
+            if (n2 != .number) {
+                return ipt.err;
+            }
+            n.number += n2.number;
+        }
+        return n;
     }
+
+    fn f_sub(ipt: *Interpreter, x: Value, env: Value) Value {
+        var y = ipt.evlis(x, env);
+        var n = ipt.car(y);
+        if (n != .number) {
+            return ipt.err;
+        }
+        while (true) {
+            y = ipt.cdr(y);
+            if (y == .nil) {
+                break;
+            }
+            const n2 = ipt.car(y);
+            if (n2 != .number) {
+                return ipt.err;
+            }
+            n.number -= n2.number;
+        }
+        return n;
+    }
+
+    fn f_mul(ipt: *Interpreter, x: Value, env: Value) Value {
+        var y = ipt.evlis(x, env);
+        var n = ipt.car(y);
+        if (n != .number) {
+            return ipt.err;
+        }
+        while (true) {
+            y = ipt.cdr(y);
+            if (y == .nil) {
+                break;
+            }
+            const n2 = ipt.car(y);
+            if (n2 != .number) {
+                return ipt.err;
+            }
+            n.number *= n2.number;
+        }
+        return n;
+    }
+
+    fn f_div(ipt: *Interpreter, x: Value, env: Value) Value {
+        var y = ipt.evlis(x, env);
+        var n = ipt.car(y);
+        if (n != .number) {
+            return ipt.err;
+        }
+        while (true) {
+            y = ipt.cdr(y);
+            if (y == .nil) {
+                break;
+            }
+            const n2 = ipt.car(y);
+            if (n2 != .number) {
+                return ipt.err;
+            }
+            n.number /= n2.number;
+        }
+        return n;
+    }
+
+    // fn f_(ipt: *Interpreter, x: Value, env: Value) Value {}
 };
 
 test "read" {
@@ -324,6 +428,11 @@ test "read" {
     ipt.print(ipt.eval(ipt.read("(+ 1 2)"), ipt.env));
     std.debug.print("\n", .{});
 
+    ipt.print(ipt.read("(+ 1 2 3)"));
+    std.debug.print("\n", .{});
+    ipt.print(ipt.eval(ipt.read("(+ 1 2 3)"), ipt.env));
+    std.debug.print("\n", .{});
+
     ipt.print(ipt.read("'(1 2)"));
     std.debug.print("\n", .{});
     ipt.print(ipt.eval(ipt.read("'(1 2)"), ipt.env));
@@ -331,12 +440,12 @@ test "read" {
 
     ipt.print(ipt.read("(car (1 2))"));
     std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("(car '(1 2))"), ipt.env));
+    ipt.print(ipt.eval(ipt.read("(car '(1 . 2))"), ipt.env));
     std.debug.print("\n", .{});
 
     ipt.print(ipt.read("(cdr (1 2))"));
     std.debug.print("\n", .{});
-    ipt.print(ipt.eval(ipt.read("(cdr '(1 2))"), ipt.env));
+    ipt.print(ipt.eval(ipt.read("(cdr '(1 . 2))"), ipt.env));
     std.debug.print("\n", .{});
 
     ipt.print(ipt.read("(3 . 4)"));
