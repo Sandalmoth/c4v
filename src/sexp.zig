@@ -15,7 +15,7 @@ const Pool = @import("pool.zig").Pool;
 // and to be able to disambiguate these structures (regardless of nesting)
 // we just make them out of three types of cons, with identical semantics
 
-pub const ValueType = enum { atom, cons, nil };
+pub const ValueType = enum { atom, cons, acons, mcons, nil };
 pub const Value = union(ValueType) {
     atom: u32, // key into interning table
     cons: [*]Value,
@@ -49,7 +49,6 @@ const TokenType = enum {
     R_BRACK,
     L_CURLY,
     R_CURLY,
-    DOT,
     ATOM,
     ERROR,
     EOF,
@@ -67,7 +66,7 @@ const Scanner = struct {
     start: u32 = 0,
     cursor: u32 = 0,
 
-    errtext: []const u8 = &.{},
+    errbuf: []const u8 = &.{},
 
     fn lexeme(scanner: Scanner, token: Token) []const u8 {
         return switch (token.type) {
@@ -77,7 +76,6 @@ const Scanner = struct {
             .R_BRACK => "]",
             .L_CURLY => "{",
             .R_CURLY => "}",
-            .DOT => ".",
             .ATOM => {
                 var s: Scanner = .{
                     .src = scanner.src,
@@ -94,7 +92,7 @@ const Scanner = struct {
     }
 
     /// slow, intended for printing error messages
-    fn line(scanner: Scanner, token: Token) u32 {
+    fn line_nr(scanner: Scanner, token: Token) u32 {
         var cursor: u32 = 0;
         var ln: u32 = 0;
         while (cursor < token.start) : (cursor += 1) {
@@ -106,7 +104,24 @@ const Scanner = struct {
     }
 
     /// slow, intended for printing error messages
-    fn column(scanner: Scanner, token: Token) u32 {
+    fn line(scanner: Scanner, token: Token) []const u8 {
+        var cursor: u32 = 0;
+        var line_start: u32 = 0;
+        while (cursor < token.start) : (cursor += 1) {
+            if (scanner.src[cursor] == '\n') {
+                line_start = cursor + 1;
+            }
+        }
+        while (cursor < token.start) : (cursor += 1) {
+            if (scanner.src[cursor] == '\n') {
+                break;
+            }
+        }
+        return scanner.src[line_start..cursor];
+    }
+
+    /// slow, intended for printing error messages
+    fn column_nr(scanner: Scanner, token: Token) u32 {
         var cursor: u32 = 0;
         var col: u32 = 0;
         while (cursor < token.start) : (cursor += 1) {
@@ -134,7 +149,6 @@ const Scanner = struct {
             ']' => Token{ .type = .R_BRACK, .start = scanner.start },
             '{' => Token{ .type = .L_CURLY, .start = scanner.start },
             '}' => Token{ .type = .R_CURLY, .start = scanner.start },
-            '.' => Token{ .type = .DOT, .start = scanner.start },
             'a'...'z', 'A'...'Z', '0'...'9' => scanner.atom(),
             '"' => scanner.string(), // also an atom, but different lexing
             else => scanner.err("Unexpected character"),
@@ -145,7 +159,7 @@ const Scanner = struct {
         // NOTE what do I want to allow?
         return switch (c) {
             'a'...'z', 'A'...'Z', '0'...'9' => true,
-            '-', '?' => true,
+            '-', '?', '.' => true,
             // '-', '+', '*', '/' => true,
             // '=', '<', '>' => true,
             // '!', '?', '_', '.' => true,
@@ -168,7 +182,7 @@ const Scanner = struct {
     }
 
     fn err(scanner: *Scanner, text: []const u8) Token {
-        scanner.errtext = text;
+        scanner.errbuf = text;
         return Token{ .type = .ERROR, .start = scanner.start };
     }
 
@@ -211,123 +225,249 @@ test "Scanner" {
     try std.testing.expectEqual(TokenType.ATOM, s.scan().type);
     try std.testing.expectEqual(TokenType.L_BRACK, s.scan().type);
 
-    // while (true) {
-    //     const token = s.scan();
-    //     if (token.type == .EOF) break;
-    //     std.debug.print("{}\t{}\t{}\t{s}\n", .{ s.line(token), s.column(token), token.type, s.lexeme(token) });
+    // {
+    //     var s2: Scanner = .{ .src = "(add 1 2)" };
+    //     while (true) {
+    //         const token = s2.scan();
+    //         if (token.type == .EOF) break;
+    //         std.debug.print("{}\t{}\t{}\t{s}\n", .{ s2.line_nr(token), s2.column_nr(token), token.type, s2.lexeme(token) });
+    //     }
     // }
 }
 
-// pub const Parser = struct {
-//     const nil = Value{ .nil = {} };
-//     const car = Value.car;
-//     const cdr = Value.cdr;
+pub const Parser = struct {
+    const ParserErrors = error{ParseFail};
+    const nil = Value{ .nil = {} };
+    const car = Value.car;
+    const cdr = Value.cdr;
 
-//     alloc: std.mem.Allocator,
-//     conses: Pool([2]Value),
-//     interned: std.StringHashMap(u32),
-//     intern_data: std.ArrayList([]const u8),
+    alloc: std.mem.Allocator,
+    conses: Pool([2]Value),
+    interned: std.StringHashMap(u32),
+    intern_data: std.ArrayList([]const u8),
 
-//     scanner: Scanner,
+    scanner: Scanner,
+    current: Token,
+    previous: Token,
 
-//     pub fn init(alloc: std.mem.Allocator, src: []const u8) Parser {
-//         return .{
-//             .alloc = alloc,
-//             .conses = Pool([2]Value).init(alloc),
-//             .interned = std.StringHashMap(u32).init(alloc),
-//             .intern_data = std.ArrayList([]const u8).init(alloc),
-//             .scanner = Scanner{ .src = src },
-//         };
-//     }
+    pub fn init(alloc: std.mem.Allocator, src: []const u8) Parser {
+        var parser: Parser = .{
+            .alloc = alloc,
+            .conses = Pool([2]Value).init(alloc),
+            .interned = std.StringHashMap(u32).init(alloc),
+            .intern_data = std.ArrayList([]const u8).init(alloc),
+            .scanner = Scanner{ .src = src },
+            .current = Token{ .type = .ERROR, .start = 0 },
+            .previous = Token{ .type = .ERROR, .start = 0 },
+        };
+        parser.advance();
+        return parser;
+    }
 
-//     pub fn deinit(parser: *Parser) void {
-//         parser.intern_data.deinit();
-//         parser.interned.deinit();
-//         parser.conses.deinit();
-//         parser.* = undefined;
-//     }
+    pub fn deinit(parser: *Parser) void {
+        parser.intern_data.deinit();
+        parser.interned.deinit();
+        parser.conses.deinit();
+        parser.* = undefined;
+    }
 
-//     // each call to parse reads one s-expression
-//     pub fn parse(parser: *Parser) ?Value {
-//         while (parser.scanner.scan()) {
-//             if (parser.scanner.is("(")) {
-//                 parser.scanner.consume("(") catch @panic("expect (");
-//                 return parser.parselist();
-//             } else {
-//                 return Value{ .atom = parser.interned.get(parser.scanner.token) orelse blk: {
-//                     std.debug.assert(parser.interned.count() == parser.intern_data.items.len);
-//                     const i = parser.interned.count();
-//                     parser.interned.put(parser.scanner.token, i) catch @panic("out of memory");
-//                     parser.intern_data.append(parser.scanner.token) catch @panic("out of memory");
-//                     break :blk i;
-//                 } };
-//             }
-//         }
+    // each call to parse reads one s-expression from source
+    pub fn parse(parser: *Parser) ParserErrors!?Value {
+        if (parser.match(.EOF)) {
+            return null;
+        }
 
-//         return null;
-//     }
+        if (parser.match(.R_PAREN) or parser.match(.R_BRACK) or parser.match(.R_CURLY)) {
+            // we cannot end a list or similar without first starting one
+            parser.err(parser.current, "sequence closed without a matching opener");
+            return error.ParseFail;
+        }
 
-//     fn parselist(parser: *Parser) Value {
-//         // parse a list
-//         if (parser.scanner.is(")")) {
-//             return nil;
-//         } else if (parser.scanner.is(".")) {
-//             const x = parser.parse() orelse @panic("unexpected end of list");
-//             parser.scanner.consume(")") catch @panic("expect )");
-//             return x;
-//         } else {
-//             const x = parser.parse() orelse @panic("unexpected end of list");
-//             return parser.cons(x, parser.parselist());
-//         }
-//     }
+        if (parser.match(.L_PAREN)) {
+            return try parser.parse_list();
+        } else if (parser.match(.L_BRACK)) {
+            return try parser.parse_array();
+        } else if (parser.match(.L_CURLY)) {
+            return try parser.parse_map();
+        } else {
+            const result = Value{
+                .atom = parser.interned.get(parser.scanner.lexeme(parser.current)) orelse blk: {
+                    // we have yet to inter this string so do it now
+                    std.debug.assert(parser.interned.count() == parser.intern_data.items.len);
+                    const i = parser.interned.count();
+                    const lexeme = parser.scanner.lexeme(parser.current);
+                    parser.interned.put(lexeme, i) catch @panic("out of memory");
+                    parser.intern_data.append(lexeme) catch @panic("out of memory");
+                    break :blk i;
+                },
+            };
+            parser.advance();
+            return result;
+        }
 
-//     pub fn print(parser: Parser, x: Value) void {
-//         switch (x) {
-//             .atom => |atom| std.debug.print("atom:{s}", .{parser.intern_data.items[atom]}),
-//             .cons => parser.printlist(x),
-//             .nil => std.debug.print("nil", .{}),
-//         }
-//     }
+        unreachable;
+    }
 
-//     fn printlist(parser: Parser, _x: Value) void {
-//         var x = _x;
-//         std.debug.print("(", .{});
-//         while (true) : (std.debug.print(" ", .{})) {
-//             parser.print(car(x));
-//             x = cdr(x);
-//             if (x == .nil) {
-//                 break;
-//             }
-//             if (x != .cons) {
-//                 std.debug.print(" . ", .{});
-//                 parser.print(x);
-//                 break;
-//             }
-//         }
-//         std.debug.print(")", .{});
-//     }
+    fn parse_list(parser: *Parser) !Value {
+        // parse a list
+        if (parser.match(.R_PAREN)) {
+            return nil;
+        } else {
+            const x = try parser.parse() orelse {
+                parser.err(parser.previous, "unexpected end of list");
+                return error.ParseFail;
+            };
+            return parser.cons(.cons, x, try parser.parse_list());
+        }
+    }
 
-//     fn cons(parser: *Parser, a: Value, d: Value) Value {
-//         var pair = parser.conses.create() catch @panic("out of memory");
-//         pair[0] = a;
-//         pair[1] = d;
-//         return Value{ .cons = pair.ptr };
-//     }
+    fn parse_array(parser: *Parser) !Value {
+        // parse a list
+        if (parser.match(.R_BRACK)) {
+            return nil;
+        } else {
+            const x = try parser.parse() orelse {
+                parser.err(parser.previous, "unexpected end of array");
+                return error.ParseFail;
+            };
+            return parser.cons(.acons, x, try parser.parse_array());
+        }
+    }
 
-//     // fn peek
-// };
+    fn parse_map(parser: *Parser) !Value {
+        // parse a list
+        if (parser.match(.R_CURLY)) {
+            return nil;
+        } else {
+            const k = try parser.parse() orelse {
+                parser.err(parser.previous, "unexpected end of map");
+                return error.ParseFail;
+            };
+            const v = try parser.parse() orelse {
+                parser.err(parser.previous, "unexpected end of map");
+                return error.ParseFail;
+            };
+            return parser.cons(.mcons, parser.cons(.mcons, k, v), try parser.parse_map());
+        }
+    }
 
-// test "basic parsing" {
-//     std.debug.print("\n", .{});
+    pub fn print(parser: Parser, x: Value) void {
+        switch (x) {
+            .atom => |atom| std.debug.print("{s}", .{parser.intern_data.items[atom]}),
+            .cons => parser.print_list(x),
+            .acons => parser.print_array(x),
+            .mcons => parser.print_map(x),
+            .nil => std.debug.print("nil", .{}),
+        }
+    }
 
-//     var parser = Parser.init(
-//         std.testing.allocator,
-//         "(+ 1 2)",
-//     );
-//     defer parser.deinit();
+    fn print_list(parser: Parser, _x: Value) void {
+        var x = _x;
+        std.debug.print("(", .{});
+        while (true) : (std.debug.print(" ", .{})) {
+            parser.print(car(x));
+            x = cdr(x);
+            if (x == .nil) {
+                break;
+            }
+            if (x != .cons) {
+                std.debug.print(" . ", .{});
+                parser.print(x);
+                break;
+            }
+        }
+        std.debug.print(")", .{});
+    }
 
-//     while (parser.parse()) |x| {
-//         parser.print(x);
-//         std.debug.print("\n", .{});
-//     }
-// }
+    fn print_array(parser: Parser, _x: Value) void {
+        var x = _x;
+        std.debug.print("[", .{});
+        while (true) : (std.debug.print(" ", .{})) {
+            parser.print(car(x));
+            x = cdr(x);
+            if (x == .nil) {
+                break;
+            }
+        }
+        std.debug.print("]", .{});
+    }
+
+    fn print_map(parser: Parser, _x: Value) void {
+        var x = _x;
+        std.debug.print("{{", .{});
+        while (true) : (std.debug.print(" ", .{})) {
+            parser.print(car(car(x)));
+            std.debug.print(" ", .{});
+            parser.print(cdr(car(x)));
+            x = cdr(x);
+            if (x == .nil) {
+                break;
+            }
+        }
+        std.debug.print("}}", .{});
+    }
+
+    fn consume(parser: *Parser, t: TokenType, message: []const u8) void {
+        if (!(parser.current.type == t)) {
+            parser.advance();
+            return;
+        }
+        parser.err(parser.current, message);
+    }
+
+    fn match(parser: *Parser, t: TokenType) bool {
+        if (!(parser.current.type == t)) {
+            return false;
+        }
+        parser.advance();
+        return true;
+    }
+
+    /// move forwards one token, report scanner errors if found
+    fn advance(parser: *Parser) void {
+        parser.previous = parser.current;
+        parser.current = parser.scanner.scan();
+        if (parser.current.type == .ERROR) {
+            parser.err(parser.current, parser.scanner.errbuf);
+        }
+    }
+
+    fn cons(parser: *Parser, comptime t: ValueType, a: Value, d: Value) Value {
+        var pair = parser.conses.create() catch @panic("out of memory");
+        pair[0] = a;
+        pair[1] = d;
+        return switch (t) {
+            .cons => Value{ .cons = pair.ptr },
+            .acons => Value{ .acons = pair.ptr },
+            .mcons => Value{ .mcons = pair.ptr },
+            else => @compileError("cons must be a cons type"),
+        };
+    }
+
+    fn err(parser: Parser, token: Token, message: []const u8) void {
+        std.debug.print("{}\n", .{token});
+        std.debug.print("Error: {s}\n", .{message});
+        std.debug.print("{}\t: {s}\n", .{ parser.scanner.line_nr(token), parser.scanner.line(token) });
+        std.debug.print("\t  ", .{});
+        var i = parser.scanner.column_nr(token);
+        while (i > 1) : (i -= 1) {
+            std.debug.print(" ", .{});
+        }
+        std.debug.print("^\n", .{});
+    }
+};
+
+test "basic parsing" {
+    std.debug.print("\n", .{});
+
+    var parser = Parser.init(
+        std.testing.allocator,
+        "(add 1 (mul 2 2)) (conj \"hello\" \"world\")\n[1 2 3]\n{k0 v0 k1 v1}",
+    );
+    defer parser.deinit();
+
+    while (try parser.parse()) |x| {
+        parser.print(x);
+        std.debug.print("\n", .{});
+    }
+}
