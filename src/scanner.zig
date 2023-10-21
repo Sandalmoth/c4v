@@ -5,8 +5,8 @@ pub const TokenType = enum {
 
     L_PAREN, // (
     R_PAREN, // )
-    L_BRACK, // [
-    R_BRACK, // ]
+    L_BRACK, // [ unused
+    R_BRACK, // ] unused
     L_CURLY, // {
     R_CURLY, // }
 
@@ -84,21 +84,21 @@ const Scanner = struct {
         const c = scanner.at();
         return switch (c) {
             '(', ')', '[', ']', '{', '}', '.', '\'', '`', ',', ':' => @call(
-                .must_tail,
+                .always_tail,
                 Scanner.symbol,
                 .{scanner},
             ),
-            '#' => @call(.must_tail, Scanner.dispatch, .{scanner}),
-            '0'...'9' => @call(.must_tail, Scanner.number, .{scanner}),
-            '"' => @call(.must_tail, Scanner.string, .{scanner}),
-            '+', '-' => @call(.must_tail, Scanner.sign, .{scanner}),
+            '#' => @call(.always_tail, Scanner.dispatch, .{scanner}),
+            '0'...'9' => @call(.always_tail, Scanner.number, .{scanner}),
+            '"' => @call(.always_tail, Scanner.string, .{scanner}),
+            '+', '-' => @call(.always_tail, Scanner.sign, .{scanner}),
             else => blk: {
                 if (is_initial(c)) {
-                    break :blk @call(.must_tail, Scanner.identifier, .{scanner});
+                    break :blk @call(.always_tail, Scanner.identifier, .{scanner});
                 } else if (is_whitespace(c)) {
-                    break :blk @call(.must_tail, Scanner.whitespace, .{scanner});
+                    break :blk @call(.always_tail, Scanner.whitespace, .{scanner});
                 }
-                break :blk @call(.must_tail, Scanner.err, .{ scanner, "unexpected character" });
+                break :blk @call(.always_tail, Scanner.err, .{ scanner, "unexpected character" });
             },
         };
     }
@@ -179,7 +179,7 @@ const Scanner = struct {
         scanner.start = scanner.cursor;
         scanner.result.tokens.append(t);
 
-        @call(.must_tail, Scanner.begin, .{scanner});
+        @call(.always_tail, Scanner.begin, .{scanner});
     }
 };
 
@@ -227,7 +227,7 @@ fn is_hexadecimal_digit(c: u8) bool {
 
 fn is_initial(c: u8) bool {
     return is_letter(c) or switch (c) {
-        '/', '*', '=', '<', '>' => true,
+        '+', '-', '/', '*', '=', '<', '>', '?' => true,
         else => false,
     };
 }
