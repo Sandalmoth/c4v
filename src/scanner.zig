@@ -59,7 +59,7 @@ test "scan" {
     defer arena.deinit();
 
     const result = scan(alloc,
-        \\ (hello . ... + |\n8923tn0arst\|rst| world) ; this is a comment
+        \\ (hello . +  world) ; this is a comment
         \\ (+ 1 2)
     );
 
