@@ -51,4 +51,9 @@ pub const Value = union(ValueType) {
             else => false,
         };
     }
+
+    pub fn print(x: Value) void {
+        _ = x;
+        std.debug.print("a value", .{});
+    }
 };

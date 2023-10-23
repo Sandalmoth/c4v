@@ -12,6 +12,7 @@ pub const Opcode = enum(u8) {
     // BRANCH,
     // SAVE_CONTINUATION,
     // APPLY,
+    PRINT,
     HALT,
 };
 
@@ -22,26 +23,26 @@ pub const Instruction = packed struct {
     c: u8 = 255,
 };
 
-pub const Bytecode = struct {
+pub const Chunk = struct {
     bc: std.ArrayList(u32),
     constants: std.ArrayList(Value),
 
-    pub fn init(alloc: std.mem.Allocator) Bytecode {
+    pub fn init(alloc: std.mem.Allocator) Chunk {
         return .{
             .bc = std.ArrayList(u32).init(alloc),
             .constants = std.ArrayList(Value).init(alloc),
         };
     }
 
-    pub fn deinit(bc: *Bytecode) void {
+    pub fn deinit(bc: *Chunk) void {
         bc.bc.deinit();
         bc.constants.deinit();
         bc.* = undefined;
     }
 
-    pub fn push_op(bc: *Bytecode, op: Opcode) void {
-        bc.append(
+    pub fn push_op(bc: *Chunk, op: Opcode) void {
+        bc.bc.append(
             @bitCast(Instruction{ .op = op }),
-        ) catch @panic("Bytecode.push_op: Out of memory");
+        ) catch @panic("Chunk.push_op: Out of memory");
     }
 };
