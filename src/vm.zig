@@ -7,6 +7,7 @@ const Value = @import("value.zig").Value;
 const Chunk = @import("bytecode.zig").Chunk;
 const Opcode = @import("bytecode.zig").Opcode;
 const Instruction = @import("bytecode.zig").Instruction;
+const Instruction_opaS = @import("bytecode.zig").Instruction_opaS;
 
 pub const VMError = error{RuntimeError};
 
@@ -40,6 +41,8 @@ pub const VM = struct {
 
             .ADD => @call(.always_tail, op_add, .{ vm, ip, lits }),
             .COPY => @call(.always_tail, op_copy, .{ vm, ip, lits }),
+            .LT => @call(.always_tail, op_lt, .{ vm, ip, lits }),
+            .JUMP_IF_FALSE => @call(.always_tail, op_jump_if_false, .{ vm, ip, lits }),
         }
     }
 
@@ -84,6 +87,33 @@ pub const VM = struct {
 
         return @call(.always_inline, dispatch, .{ vm, ip + 1, lits });
     }
+
+    pub fn op_lt(vm: *VM, ip: [*]u32, lits: [*]Value) VMError!void {
+        var x: Instruction = @bitCast(ip[0]);
+        vm.registers[x.a] = if (q.lt(vm.registers[x.b].NUMBER, vm.registers[x.c].NUMBER))
+            Value{ .TRUE = {} }
+        else
+            Value{ .FALSE = {} };
+
+        return @call(.always_inline, dispatch, .{ vm, ip + 1, lits });
+    }
+
+    pub fn op_jump_if_false(vm: *VM, ip: [*]u32, lits: [*]Value) VMError!void {
+        var x: Instruction_opaS = @bitCast(ip[0]);
+        var jump: i16 = 1; // if true, just go on to the next instruction
+        if (vm.registers[x.a] == .FALSE) {
+            jump = x.S;
+        }
+
+        // this is really ugly, allow pointer arithmetic with signed numbers please...
+        var addr: isize = @intCast(@intFromPtr(ip));
+        addr += jump * 4; // note *4 since our instructions are u32, i.e. 4 bytes
+        return @call(.always_inline, dispatch, .{
+            vm,
+            @as([*]u32, @ptrFromInt(@as(usize, @intCast(addr)))),
+            lits,
+        });
+    }
 };
 
 test "playground" {
@@ -94,15 +124,35 @@ test "playground" {
 
     _ = bc.add_const(Value{ .NUMBER = q.fixedFromInt(0) });
     _ = bc.add_const(Value{ .NUMBER = q.fixedFromInt(1) });
+    _ = bc.add_const(Value{ .NUMBER = q.fixedFromInt(67) });
+
     bc.push_opab(.FETCH_LITERAL, 0, 0);
     bc.push_opab(.FETCH_LITERAL, 1, 1);
 
-    for (0..100) |_| {
-        bc.push_opabc(.ADD, 2, 0, 1); // reg[2] = reg[0] + reg[1]
-        bc.push_opab(.COPY, 0, 1); //    reg[0] = reg[1]
-        bc.push_opab(.COPY, 1, 2); //    reg[1] = reg[2]
-        bc.push_opa(.PRINT, 2);
-    }
+    bc.push_opab(.FETCH_LITERAL, 4, 2); // for comparison at loop end
+    bc.push_opab(.COPY, 3, 0); // initialize loop variable
+    bc.push_opab(.COPY, 5, 1); // for incrementing the loop variable
+
+    // calculate fibonnaci
+    bc.push_opabc(.ADD, 2, 0, 1); // reg[2] = reg[0] + reg[1]
+    bc.push_opab(.COPY, 0, 1); //    reg[0] = reg[1]
+    bc.push_opab(.COPY, 1, 2); //    reg[1] = reg[2]
+
+    // increment loop variable
+    bc.push_opabc(.ADD, 3, 3, 5); // reg[2] = reg[0] + reg[1]
+
+    // test if we have looped enough
+    bc.push_opabc(.LT, 6, 4, 3);
+    bc.push_opaS(.JUMP_IF_FALSE, 6, -5);
+
+    // for (0..100) |_| {
+    //     bc.push_opabc(.ADD, 2, 0, 1); // reg[2] = reg[0] + reg[1]
+    //     bc.push_opab(.COPY, 0, 1); //    reg[0] = reg[1]
+    //     bc.push_opab(.COPY, 1, 2); //    reg[1] = reg[2]
+    //     bc.push_opa(.PRINT, 2);
+    // }
+
+    bc.push_opa(.PRINT, 2);
 
     bc.push_op(.HALT);
 

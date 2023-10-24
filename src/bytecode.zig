@@ -17,6 +17,8 @@ pub const Opcode = enum(u8) {
 
     ADD,
     COPY,
+    LT,
+    JUMP_IF_FALSE,
 };
 
 pub const Instruction = packed struct {
@@ -24,6 +26,12 @@ pub const Instruction = packed struct {
     a: u8 = 255,
     b: u8 = 255,
     c: u8 = 255,
+};
+
+pub const Instruction_opaS = packed struct {
+    op: Opcode,
+    a: u8 = 255,
+    S: i16 = -32768,
 };
 
 pub const Chunk = struct {
@@ -61,7 +69,7 @@ pub const Chunk = struct {
             .op = op,
             .a = a,
             .b = b,
-        })) catch @panic("Chunk.push_opa: Out of memory");
+        })) catch @panic("Chunk.push_opab: Out of memory");
     }
 
     pub fn push_opabc(bc: *Chunk, op: Opcode, a: u8, b: u8, c: u8) void {
@@ -70,7 +78,15 @@ pub const Chunk = struct {
             .a = a,
             .b = b,
             .c = c,
-        })) catch @panic("Chunk.push_opa: Out of memory");
+        })) catch @panic("Chunk.push_opabc: Out of memory");
+    }
+
+    pub fn push_opaS(bc: *Chunk, op: Opcode, a: u8, S: i16) void {
+        bc.bc.append(@bitCast(Instruction_opaS{
+            .op = op,
+            .a = a,
+            .S = S,
+        })) catch @panic("Chunk.push_opaS: Out of memory");
     }
 
     pub fn add_const(bc: *Chunk, x: Value) u8 {
