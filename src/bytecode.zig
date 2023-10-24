@@ -3,7 +3,7 @@ const std = @import("std");
 const Value = @import("value.zig").Value;
 
 pub const Opcode = enum(u8) {
-    // FETCH_LITERAL,
+    FETCH_LITERAL,
     // LOOKUP_VARIABLE,
     // BIND,
     // BRANCH_IF_FALSE,
@@ -14,6 +14,9 @@ pub const Opcode = enum(u8) {
     // APPLY,
     PRINT,
     HALT,
+
+    ADD,
+    COPY,
 };
 
 pub const Instruction = packed struct {
@@ -41,8 +44,38 @@ pub const Chunk = struct {
     }
 
     pub fn push_op(bc: *Chunk, op: Opcode) void {
-        bc.bc.append(
-            @bitCast(Instruction{ .op = op }),
-        ) catch @panic("Chunk.push_op: Out of memory");
+        bc.bc.append(@bitCast(Instruction{
+            .op = op,
+        })) catch @panic("Chunk.push_op: Out of memory");
+    }
+
+    pub fn push_opa(bc: *Chunk, op: Opcode, a: u8) void {
+        bc.bc.append(@bitCast(Instruction{
+            .op = op,
+            .a = a,
+        })) catch @panic("Chunk.push_opa: Out of memory");
+    }
+
+    pub fn push_opab(bc: *Chunk, op: Opcode, a: u8, b: u8) void {
+        bc.bc.append(@bitCast(Instruction{
+            .op = op,
+            .a = a,
+            .b = b,
+        })) catch @panic("Chunk.push_opa: Out of memory");
+    }
+
+    pub fn push_opabc(bc: *Chunk, op: Opcode, a: u8, b: u8, c: u8) void {
+        bc.bc.append(@bitCast(Instruction{
+            .op = op,
+            .a = a,
+            .b = b,
+            .c = c,
+        })) catch @panic("Chunk.push_opa: Out of memory");
+    }
+
+    pub fn add_const(bc: *Chunk, x: Value) u8 {
+        const i = bc.constants.items.len;
+        bc.constants.append(x) catch @panic("Chunk.add_const: Ouf of memory");
+        return @intCast(i);
     }
 };

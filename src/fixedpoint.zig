@@ -3,12 +3,12 @@ const std = @import("std");
 // implements a single variant of
 // https://github.com/ziglibs/zigfp
 // originally written by Felix "xq" Queißner, released under MIT license
-// specifically, this implements Q32.32 (i64p32 in zigfp)
+// specifically, this implements Q48.16
 // however, all operators are saturating
 // it's updated for the latest zig version
 // and will eventually support other math ops that I need
 
-const scaling = 1 << 32;
+const scaling = 1 << 16;
 
 pub const Q = struct {
     raw: i64,
@@ -24,11 +24,11 @@ pub const Q = struct {
     }
 
     pub fn mul(a: Q, b: Q) Q {
-        return .{ .raw = @as(i64, @truncate((@as(i128, a.raw) * @as(i128, b.raw)) >> 32)) };
+        return .{ .raw = @as(i64, @truncate((@as(i128, a.raw) * @as(i128, b.raw)) >> 16)) };
     }
 
     pub fn div(a: Q, b: Q) Q {
-        return .{ .raw = @as(i64, @intCast(@divTrunc(@as(i128, a.raw) << 32, @as(i128, b.raw)))) };
+        return .{ .raw = @as(i64, @intCast(@divTrunc(@as(i128, a.raw) << 16, @as(i128, b.raw)))) };
     }
 
     pub fn mod(a: Q, b: Q) Q {
@@ -59,14 +59,14 @@ pub const Q = struct {
         if (comptime (fmt.len == 0 or std.mem.eql(u8, fmt, "any") or std.mem.eql(u8, fmt, "d"))) {
             var copy_options = if (options.precision == null) blk: {
                 var copy = options;
-                copy.precision = 10; // 9 < log10(32) < 10
+                copy.precision = 5; // 4 < log10(2^32) < 5
                 break :blk copy;
             } else options;
-            try std.fmt.formatFloatDecimal(floatFromFixed(f32, x), copy_options, writer);
+            try std.fmt.formatFloatDecimal(floatFromFixed(f64, x), copy_options, writer);
         } else if (comptime std.mem.eql(u8, fmt, "x")) {
-            try std.fmt.formatFloatHexadecimal(floatFromFixed(f32, x), options, writer);
+            try std.fmt.formatFloatHexadecimal(floatFromFixed(f64, x), options, writer);
         } else if (comptime std.mem.eql(u8, fmt, "e")) {
-            try std.fmt.formatFloatScientific(floatFromFixed(f32, x), options, writer);
+            try std.fmt.formatFloatScientific(floatFromFixed(f64, x), options, writer);
         } else {
             @compileError(std.fmt.comptimePrint("Invalid fmt for Q (fixed point): {{{s}}}", .{fmt}));
         }
@@ -98,11 +98,11 @@ pub fn floatFromFixed(comptime T: type, x: Q) T {
 }
 
 pub fn fixedFromInt(x: anytype) Q {
-    return .{ .raw = @as(i64, x) <<| 32 };
+    return .{ .raw = @as(i64, x) <<| 16 };
 }
 
 pub fn intFromFixed(comptime T: type, x: Q) T {
-    return @intCast(x.raw >> 32);
+    return @intCast(x.raw >> 16);
 }
 
 test "conversion" {

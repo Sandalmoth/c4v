@@ -53,7 +53,16 @@ pub const Value = union(ValueType) {
     }
 
     pub fn print(x: Value) void {
-        _ = x;
-        std.debug.print("a value", .{});
+        switch (x) {
+            .NUMBER => |y| std.debug.print("{}", .{y}),
+            .CONS => {
+                std.debug.print("(", .{});
+                car(x).print();
+                std.debug.print(" ", .{});
+                cdr(x).print();
+                std.debug.print(")", .{});
+            },
+            else => std.debug.print("<{}>", .{x}),
+        }
     }
 };
