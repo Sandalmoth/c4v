@@ -2,45 +2,48 @@ const std = @import("std");
 
 const Pool = @import("pool.zig").Pool;
 const Value = @import("value.zig").Value;
-const Parser = @import("parser.zig").Parser;
+const Chunk = @import("bytecode.zig").Chunk;
+const VM = @import("vm.zig").VM;
 
-pub const Thunk = struct {
-    pub fn print(thunk: *Thunk) void {
-        _ = thunk;
-    }
-};
+// const _scanner = @import("scanner.zig");
+
+const Rib = @import("value.zig").Rib;
+
+pub fn compile(compiler: *Compiler, vm: *VM, src: []const u8) Chunk {
+    // by having the vm present when compiling
+    // we should be able to compile partial code in a historical context
+    // similarly to a REPL
+
+    _ = compiler;
+    _ = vm;
+    _ = src;
+
+    // const sr = _scanner.scan(compiler.scratch_arena.allocator(), src);
+
+}
 
 pub const Compiler = struct {
     alloc: std.mem.Allocator,
-    conses: Pool([2]Value),
-    interned: std.StringHashMap(u32),
-    intern_data: std.ArrayList([]const u8),
 
-    parser: Parser,
+    // temporary memory during compilation
+    arena_scratch: std.heap.ArenaAllocator,
 
     pub fn init(alloc: std.mem.Allocator) Compiler {
         var compiler: Compiler = .{
             .alloc = alloc,
-            .conses = Pool([2]Value).init(alloc),
-            .interned = std.StringHashMap(u32).init(alloc),
-            .intern_data = std.ArrayList([]const u8).init(alloc),
-            .parser = undefined,
+            .arena_scratch = undefined,
+            .arena_progmem = undefined,
         };
-        compiler.parser = Parser.init(&compiler);
-        compiler.parser.advance();
+        compiler.arena_scratch = std.heap.ArenaAllocator.init(alloc);
+        errdefer compiler.arena_scratch.deinit();
+
         return compiler;
     }
 
     pub fn deinit(compiler: *Compiler) void {
-        compiler.intern_data.deinit();
-        compiler.interned.deinit();
-        compiler.conses.deinit();
-        compiler.* = undefined;
-    }
+        compiler.arena_scratch.deinit();
 
-    pub fn compile(compiler: *Compiler, src: []const u8) !Thunk {
-        var parser = Parser.init(src, &compiler);
-        parser.advance();
+        compiler.* = undefined;
     }
 };
 
@@ -50,7 +53,10 @@ test "dev" {
     var compiler = Compiler.init(std.testing.allocator);
     defer compiler.deinit();
 
-    const t = try compiler.compile(
+    var vm = VM.init(std.testing.allocator);
+    defer vm.deinit();
+
+    const t = try compile(
         \\ (+ 1 2)
     );
     t.print();
