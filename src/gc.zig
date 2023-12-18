@@ -1,51 +1,23 @@
 const std = @import("std");
 
-const MIN_ALIGN = @max(4, @alignOf(usize)); // s.t. we have 2 bits of pointer tagging guaranteed
-const MIN_SIZE = @sizeOf(usize); // s.t. we can always fit the size in the free list
-
-pub fn Ref(comptime T: type) type {
-    return struct { ptr: *T };
-}
-
 pub const Header = struct {
-    // the header stores the size of an object
-    // meaning, if we're at *T, then adding the
-    data: usize,
-
     const Status = enum {
         free,
         live,
-        move,
         mark,
     };
 
-    fn getStatus(h: Header) Status {
-        return switch (h.data & 3) {
-            0 => .free,
-            1 => .live,
-            2 => .move,
-            3 => .mark,
-            else => @panic("bad status"),
-        };
-    }
-
-    fn setStatus(h: *Header, s: Status) void {
-        h.data = h.data & ~3 + switch (s) {
-            .free => 0,
-            .live => 1,
-            .move => 2,
-            .mark => 3,
-        };
-    }
-
-    fn ptr(h: Header) usize {
-        return h & ~3;
-    }
+    size: u32, // a fair limitation
+    final: bool, // this is the last block on page
+    status: Status,
 };
+
+const MIN_ALIGN = @max(@alignOf(Header), @alignOf(*opaque {}));
+const MIN_SIZE = @sizeOf(*opaque {}); // s.t. we can always fit the size in the free list
 
 comptime {
     std.debug.assert(@sizeOf(Header) == @sizeOf(usize));
-    std.debug.assert(@alignOf(Header) == @alignOf(usize));
+    std.debug.assert(@alignOf(Header) <= @alignOf(usize));
     std.debug.assert(@alignOf(usize) <= @sizeOf(usize)); // are there systems where this is false?
     std.debug.assert(@alignOf(usize) == @alignOf(*usize)); // i think this is true by definition?
 }
@@ -57,13 +29,14 @@ pub const Config = struct {
 
 pub fn GC(comptime config: Config) type {
     const Page = struct {
-        const capacity = (config.page_size - @sizeOf(usize)) / @sizeOf(usize);
+        const capacity = (config.page_size - @sizeOf(?*@This()));
 
-        data: [capacity]usize = undefined,
+        data: [capacity]u8 = undefined,
         next: ?*@This() = null,
     };
 
     std.debug.assert(@sizeOf(Page) == config.page_size);
+    std.debug.assert(@alignOf(Page) >= MIN_ALIGN);
 
     return struct {
         const Self = @This();
@@ -78,12 +51,16 @@ pub fn GC(comptime config: Config) type {
         // with the pointer to the next free block folling at the start of the data right after
         free: ?*Header = null,
 
-        pub fn create(gc: *Self, comptime T: type) Ref(T) {
+        pub fn create(gc: *Self, comptime T: type) *T {
             if (gc.first_page == null) {
                 gc.newPage();
             }
 
-            return Ref(T){ .ptr = undefined };
+            // find the first empty slot
+            std.debug.assert(gc.free != null);
+            var free = gc.free;
+            while (free.?.size)
+                return undefined;
 
             // var loc = std.mem.alignBackward(
             //     usize,
@@ -111,9 +88,13 @@ pub fn GC(comptime config: Config) type {
         fn newPage(gc: *Self) void {
             var page = backing_allocator.create(Page) catch @panic("GC.newPage: out of memory");
             page.* = Page{};
-            page.data[0] = Page.capacity;
-            page.data[1] = @intFromPtr(gc.free);
-            gc.free = @ptrCast(&page.data[0]);
+            @as(*Header, @alignCast(@ptrCast(&page.data[0]))).* = .{
+                .size = Page.capacity,
+                .final = true,
+                .status = .free,
+            };
+            @as(*?*Header, @alignCast(@ptrCast(&page.data[@sizeOf(Header)]))).* = gc.free;
+            gc.free = @alignCast(@ptrCast(&page.data[0]));
             page.next = gc.first_page;
             gc.first_page = page;
         }
