@@ -19,18 +19,13 @@ test "roundUp" {
     try std.testing.expectEqual(32, roundup(24, 16));
 }
 
-pub fn GarbageCollector(comptime Spec: type, comptime config: Config) type {
-    const TracedType = std.meta.FieldEnum(Spec);
-    const n_types = std.meta.fields(TracedType).len;
-
+pub fn GarbageCollector(comptime config: Config) type {
     const Page = struct {
         data: [config.capacity]u8,
         // could be a bitset, but this is simpler
         // and right now i want to get to working
         info: [config.capacity / config.unit]u8,
     };
-
-    _ = n_types;
 
     return struct {
         const GC = @This();
@@ -61,10 +56,10 @@ pub fn GarbageCollector(comptime Spec: type, comptime config: Config) type {
             return gc;
         }
 
-        pub fn create(gc: *GC, comptime t: TracedType) *TTT(t) {
-            if (@alignOf(TTT(t)) <= config.unit) {
+        pub fn create(gc: *GC, comptime T: type) *T {
+            if (@alignOf(T) <= config.unit) {
                 const p = gc.free;
-                gc.free += roundup(@sizeOf(TTT(t)), config.unit);
+                gc.free += roundup(@sizeOf(T), config.unit);
                 return @alignCast(@ptrCast(p));
             } else {
                 @panic("unimplemented");
@@ -80,62 +75,24 @@ pub fn GarbageCollector(comptime Spec: type, comptime config: Config) type {
 
         /// call this on all roots and all external references to GC'd memory
         /// returns the new address
-        pub fn trace(gc: *GC, comptime t: TracedType, root: ?*TTT(t)) ?*TTT(t) {
-            if (root == null) {
-                return null;
-            }
-
-            // if we haven't moved this, move and overwrite original with new address
-            // if we have already moved the item, ???
-
-            var new: ?*TTT(t) = null;
+        pub fn trace(gc: *GC, comptime T: type, root: *T) *T {
+            var new: *T = undefined;
             const root_info = gc.info(root);
 
             switch (root_info.*) {
                 0 => {
-                    std.debug.print("moving\n", .{});
-                    // move
-                    new = gc.create(t);
-                    new.?.* = root.?.*;
-                    @as(*?*TTT(t), @alignCast(@ptrCast(root.?))).* = new;
+                    // move into new half-space
+                    new = gc.create(T);
+                    new.* = root.*;
+                    @as(**T, @alignCast(@ptrCast(root))).* = new;
                     root_info.* = 1;
 
-                    const type_info = @typeInfo(TTT(t));
-                    std.debug.print("{}\n", .{type_info});
-
-                    switch (type_info) {
-                        .Optional => |optional| {
-                            const optinfo = @typeInfo(optional.child);
-                            if (optinfo == .Pointer) {
-                                if (comptime iTTT(optinfo.Pointer.child)) |child| {
-                                    std.debug.print("YO\n", .{});
-                                    new.?.* = gc.trace(child, root.?.*);
-                                }
-                            }
-                        },
-                        .Struct => |_struct| {
-                            inline for (_struct.fields) |field| {
-                                const fieldinfo = @typeInfo(field.type);
-                                if (fieldinfo == .Optional) {
-                                    const optinfo = @typeInfo(fieldinfo.Optional.child);
-                                    if (optinfo == .Pointer) {
-                                        if (comptime iTTT(optinfo.Pointer.child)) |child| {
-                                            std.debug.print("DAWG\n", .{});
-                                            @field(new, field.name) = gc.trace(
-                                                child,
-                                                @field(root.?, field.name),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        else => {},
-                    }
+                    // follow references
+                    new.trace(gc);
                 },
                 1 => {
-                    std.debug.print("found already moved\n", .{});
-                    new = @as(*?*TTT(t), @alignCast(@ptrCast(root.?))).*;
+                    // we've already traced this object, so just update this reference
+                    new = @as(**T, @alignCast(@ptrCast(root))).*;
                 },
                 else => unreachable,
             }
@@ -143,7 +100,6 @@ pub fn GarbageCollector(comptime Spec: type, comptime config: Config) type {
             return new;
         }
 
-        /// updates references???
         pub fn end(gc: *GC) void {
             _ = gc;
         }
@@ -171,29 +127,30 @@ pub fn GarbageCollector(comptime Spec: type, comptime config: Config) type {
                 }
             }
         }
-
-        fn TTT(comptime t: TracedType) type {
-            return std.meta.fields(Spec)[@intFromEnum(t)].type;
-        }
-
-        fn iTTT(comptime U: type) ?TracedType {
-            inline for (std.meta.fields(Spec), 0..) |field, i| {
-                if (field.type == U) {
-                    return @enumFromInt(i);
-                }
-            }
-            return null;
-        }
     };
 }
 
-const _S = struct {
+const _Int = struct {
     int: i32,
-    ptr: ?*i32,
+
+    pub inline fn trace(x: _Int, gc: anytype) void {
+        _ = x;
+        _ = gc;
+    }
+};
+
+const _IntRef = struct {
+    ptr: ?*_Int,
+
+    pub inline fn trace(x: *_IntRef, gc: anytype) void {
+        if (x.ptr) |p| {
+            x.ptr = gc.trace(_Int, p);
+        }
+    }
 };
 
 test "scratch" {
-    var gc = try GarbageCollector(_S, .{}).init(std.testing.allocator);
+    var gc = try GarbageCollector(.{}).init(std.testing.allocator);
     defer gc.deinit();
 
     std.debug.print("\n", .{});
@@ -202,24 +159,24 @@ test "scratch" {
         @sizeOf(@TypeOf(gc.from.info)),
     });
 
-    var x = gc.create(.int);
-    x.* = 1234;
-    var y = gc.create(.ptr);
-    y.* = x;
-    var z = gc.create(.ptr);
-    z.* = x;
+    var x = gc.create(_Int);
+    x.int = 1234;
+    var y = gc.create(_IntRef);
+    y.ptr = x;
+    var z = gc.create(_IntRef);
+    z.ptr = x;
 
-    std.debug.print("{*} {}\n", .{ x, x.* });
-    std.debug.print("{*} {*} {}\n", .{ y, y.*, y.*.?.* });
-    std.debug.print("{*} {*} {}\n", .{ z, z.*, z.*.?.* });
+    std.debug.print("{*} {}\n", .{ x, x.int });
+    std.debug.print("{*} {*} {}\n", .{ y, y.ptr.?, y.ptr.?.int });
+    std.debug.print("{*} {*} {}\n", .{ z, z.ptr.?, z.ptr.?.int });
 
     gc.begin();
-    y = gc.trace(.ptr, y).?;
-    x = gc.trace(.int, x).?;
-    z = gc.trace(.ptr, z).?;
+    y = gc.trace(_IntRef, y);
+    x = gc.trace(_Int, x);
+    z = gc.trace(_IntRef, z);
     gc.end();
 
-    std.debug.print("{*} {}\n", .{ x, x.* });
-    std.debug.print("{*} {*} {}\n", .{ y, y.*, y.*.?.* });
-    std.debug.print("{*} {*} {}\n", .{ z, z.*, z.*.?.* });
+    std.debug.print("{*} {}\n", .{ x, x.int });
+    std.debug.print("{*} {*} {}\n", .{ y, y.ptr.?, y.ptr.?.int });
+    std.debug.print("{*} {*} {}\n", .{ z, z.ptr.?, z.ptr.?.int });
 }
