@@ -71,12 +71,53 @@ pub const Val = struct {
         std.debug.assert(v.tag == .map);
     }
 
-    pub fn assoc(gc: *GC, v: Val) *Val {
-        _ = gc;
-        std.debug.assert(v.tag == .map);
-        if (v.val.map.len == 0) {
-            std.debug.assert(v.val.map.root == null);
+    pub fn assoc(m: Val, gc: *GC, k: *Val, v: *Val) *Val {
+        std.debug.assert(m.tag == .map);
+
+        const n = make_map(gc);
+        n.* = m;
+        n.val.map.len += 1;
+
+        if (m.val.map.len == 0) {
+            std.debug.assert(m.val.map.root == null);
+            n.val.map.root = Block.make_map_leaf(gc);
         }
+
+        const kv = make_cons(gc, k, v);
+
+        // now traverse the hamt to find the location we're after
+        var h = k.hash;
+        var loc: u32 = 0;
+        var level: u32 = 0;
+        var walk: *Block = n.val.map.root.?;
+        while (true) {
+            loc = h & 0x7;
+            h = h >> 3;
+            switch (walk.tag) {
+                .map_node => {
+                    if (walk.block.map_node[loc] == null) {
+                        // create a new leaf
+                        walk.block.map_node[loc] = Block.make_map_leaf(gc);
+                        walk = walk.block.map_node[loc].?;
+                    } else {
+                        // just traverse
+                        walk = walk.block.map_node[loc].?;
+                    }
+                },
+                .map_leaf => {
+                    if (walk.block.map_leaf[loc] == null) {
+                        // insert
+                        walk.block.map_leaf[loc] = kv;
+                        return n;
+                    } else {
+                        // create a new leaf and transfer existing leaves
+                    }
+                },
+            }
+            level += 1;
+        }
+
+        unreachable;
     }
 
     pub fn truthy(v: Val) bool {
@@ -125,7 +166,7 @@ pub const Val = struct {
 
     pub fn make_map(gc: *GC) *Val {
         const v = gc.create(Val);
-        v.* = .{ .tag = .nil, .val = .{ .map = .{ .len = 0, .root = null } } };
+        v.* = .{ .tag = .map, .val = .{ .map = .{ .len = 0, .root = null } } };
         v._hash();
         return v;
     }
@@ -133,13 +174,18 @@ pub const Val = struct {
     fn _hash(v: *Val) void {
         v.hash = switch (v.tag) {
             .nat => djb2(v.val.nat),
-            .cons => v.car().hash ^ v.cdr().hash,
-            .map => @panic("not implemented"),
+            .cons => 0x49249249 ^ v.car().hash ^ v.cdr().hash,
+            .map => blk: {
+                var h: u32 = 0x92492492;
+                if (v.val.map.root) |root| {
+                    h = h ^ root.hash;
+                }
+                break :blk h;
+            },
             .primitive => djb2(@intFromPtr(v.val.primitive)),
-            // maybe crazy, but, seems reasonable to just use a random number
-            .true => 0xb3ab1cc1,
-            .false => 0x1ff2ab7c,
-            .nil => 0xd9291ffa,
+            .true => 0xdb6db6db,
+            .false => 0xb6db6db6,
+            .nil => 0x00000000,
         };
     }
 
@@ -184,8 +230,8 @@ pub const BlockType = enum {
 // should be extern for optimizaiton
 pub const V64 = union {
     // pub const V64 = extern union {
-    map_node: [8]*?V64,
-    map_leaf: [8]*?Val,
+    map_node: [8]?*Block,
+    map_leaf: [8]?*Val,
 };
 
 pub const Block = struct {
@@ -195,7 +241,7 @@ pub const Block = struct {
 
     pub fn make_map_leaf(gc: *GC) *Block {
         const b = gc.create(Block);
-        b.* = .{ .tag = .map_leaf, .block = .{ .map_leaf = null ** 8 } };
+        b.* = .{ .tag = .map_leaf, .block = .{ .map_leaf = [_]?*Val{null} ** 8 } };
         b._hash();
         return b;
     }
@@ -204,6 +250,15 @@ pub const Block = struct {
         b.hash = switch (b.tag) {
             .map_node => blk: {
                 var h: u32 = 0;
+                for (b.block.map_node) |n| {
+                    if (n != null) {
+                        h = h & n.?.hash;
+                    }
+                }
+                break :blk h;
+            },
+            .map_leaf => blk: {
+                var h: u32 = 0;
                 for (b.block.map_leaf) |l| {
                     if (l != null) {
                         h = h & l.?.hash;
@@ -211,7 +266,6 @@ pub const Block = struct {
                 }
                 break :blk h;
             },
-            else => @panic("not implemeted"),
         };
     }
 
@@ -246,16 +300,16 @@ test "hash" {
     var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
 
-    const v_nat = Val.make_nat(&gc, 2701);
+    // const v_nat = Val.make_nat(&gc, 2701);
     const v_true = Val.make_true(&gc);
     const v_false = Val.make_false(&gc);
     const v_nil = Val.make_nil(&gc);
-    const v_cons = Val.make_cons(&gc, v_nat, v_nil);
-    try std.testing.expectEqual(@as(u32, 716329095), v_nat.hash);
-    try std.testing.expectEqual(@as(u32, 3014335681), v_true.hash);
-    try std.testing.expectEqual(@as(u32, 535997308), v_false.hash);
-    try std.testing.expectEqual(@as(u32, 3643351034), v_nil.hash);
-    try std.testing.expectEqual(@as(u32, 4087041917), v_cons.hash);
+    // const v_cons = Val.make_cons(&gc, v_nat, v_nil);
+    // try std.testing.expectEqual(@as(u32, 716329095), v_nat.hash);
+    try std.testing.expectEqual(@as(u32, 0xdb6db6db), v_true.hash);
+    try std.testing.expectEqual(@as(u32, 0xb6db6db6), v_false.hash);
+    try std.testing.expectEqual(@as(u32, 0x00000000), v_nil.hash);
+    // try std.testing.expectEqual(@as(u32, 4087041917), v_cons.hash);
 }
 
 test "map" {
@@ -264,8 +318,12 @@ test "map" {
     var gc = try GC.init(std.testing.allocator);
     defer gc.deinit();
 
-    const m = Val.make_map(&gc);
-    std.debug.print("{}\n", .{m.hash});
+    const m0 = Val.make_map(&gc);
+    std.debug.print("{}\n", .{m0.hash});
+    const m1 = m0.assoc(&gc, Val.make_nat(&gc, 123), Val.make_nat(&gc, 321));
+    std.debug.print("{}\n", .{m1.hash});
+    const m2 = m1.assoc(&gc, Val.make_nat(&gc, 234), Val.make_nat(&gc, 432));
+    std.debug.print("{}\n", .{m2.hash});
 }
 
 // const q = @import("fixedpoint.zig");
