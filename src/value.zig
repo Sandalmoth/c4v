@@ -84,40 +84,8 @@ pub const Val = struct {
         }
 
         const kv = make_cons(gc, k, v);
-
-        // now traverse the hamt to find the location we're after
-        var h = k.hash;
-        var loc: u32 = 0;
-        var level: u32 = 0;
-        var walk: *Block = n.val.map.root.?;
-        while (true) {
-            loc = h & 0x7;
-            h = h >> 3;
-            switch (walk.tag) {
-                .map_node => {
-                    if (walk.block.map_node[loc] == null) {
-                        // create a new leaf
-                        walk.block.map_node[loc] = Block.make_map_leaf(gc);
-                        walk = walk.block.map_node[loc].?;
-                    } else {
-                        // just traverse
-                        walk = walk.block.map_node[loc].?;
-                    }
-                },
-                .map_leaf => {
-                    if (walk.block.map_leaf[loc] == null) {
-                        // insert
-                        walk.block.map_leaf[loc] = kv;
-                        return n;
-                    } else {
-                        // create a new leaf and transfer existing leaves
-                    }
-                },
-            }
-            level += 1;
-        }
-
-        unreachable;
+        n.val.map.root = n.val.map.root.?.assoc(gc, kv, 0);
+        return n;
     }
 
     pub fn truthy(v: Val) bool {
@@ -239,11 +207,59 @@ pub const Block = struct {
     tag: BlockType,
     hash: u32 = 0,
 
+    pub fn make_map_node(gc: *GC) *Block {
+        const b = gc.create(Block);
+        b.* = .{ .tag = .map_node, .block = .{ .map_leaf = [_]?*Val{null} ** 8 } };
+        b._hash();
+        return b;
+    }
+
     pub fn make_map_leaf(gc: *GC) *Block {
         const b = gc.create(Block);
         b.* = .{ .tag = .map_leaf, .block = .{ .map_leaf = [_]?*Val{null} ** 8 } };
         b._hash();
         return b;
+    }
+
+    fn assoc(walk: *Block, gc: *GC, kv: *Val, depth: u5) *Block {
+        // in the case that we're inserting into a full leaf
+        // that is not at bottom level
+        // return a new node in the tree
+        // otherwise, return walk
+        const loc = (kv.hash >> (3 * depth)) & 0x7;
+        switch (walk.tag) {
+            .map_node => {
+                if (walk.block.map_node[loc] == null) {
+                    // create a new empty leaf
+                    walk.block.map_node[loc] = Block.make_map_leaf(gc);
+                } else {
+                    // copy existing block (node or leaf)
+                    const new_leaf = gc.create(Block);
+                    new_leaf.* = walk.block.map_node[loc].?.*;
+                    walk.block.map_node[loc] = new_leaf;
+                }
+                // then insert into the new leaf or copied node/leaf
+                return walk.block.map_node[loc].?.assoc(gc, kv, depth + 1);
+            },
+            .map_leaf => {
+                if (walk.block.map_leaf[loc] == null) {
+                    // slot is empty, just insert
+                    walk.block.map_leaf[loc] = kv;
+                    return walk;
+                } else {
+                    // create a new node and transfer existing kv
+                    var new_node = Block.make_map_node(gc);
+                    for (walk.block.map_leaf) |_kv| {
+                        if (_kv != null) {
+                            _ = new_node.assoc(gc, _kv.?, depth + 1);
+                        }
+                    }
+                    // finally, insert our kv into that
+                    new_node = new_node.assoc(gc, kv, depth + 1);
+                    return new_node;
+                }
+            },
+        }
     }
 
     fn _hash(b: *Block) void {
@@ -325,279 +341,3 @@ test "map" {
     const m2 = m1.assoc(&gc, Val.make_nat(&gc, 234), Val.make_nat(&gc, 432));
     std.debug.print("{}\n", .{m2.hash});
 }
-
-// const q = @import("fixedpoint.zig");
-
-// Based on the very impressive RibbitLisp
-// BSD-3-Clause license, https://github.com/udem-dlteam/ribbit/tree/dev
-// however, as my usecase isn't size minimalism
-// this implementation is significantly different
-// and makes no attempt to be compatible
-
-// comptime {
-//     // personal memory constraint for the optimization
-//     std.debug.assert(@sizeOf(Value) <= 32);
-// }
-
-// const Opcode = @import("vm.zig").Opcode;
-
-// pub const Vinstruction = struct {
-//     op: Opcode,
-//     data: *Value,
-//     next: *Vinstruction,
-// };
-
-// pub const Vcons = struct {
-//     car: *Value,
-//     cdr: *Value,
-// };
-
-// pub const Vtype = enum {
-//     INSTR,
-//     CONS,
-//     NAT,
-
-//     TRUE,
-//     FALSE,
-//     NIL,
-// };
-// pub const Value = union(Vtype) {
-//     INSTR: Vinstruction,
-//     CONS: Vcons, // pointer to a length 2 array of values
-//     NAT: u64, // fixed point number
-//     TRUE: void,
-//     FALSE: void,
-//     NIL: void,
-
-//     pub fn car(x: Value) *Value {
-//         return x.CONS[0];
-//         // switch (x) {
-//         //     .CONS => |cons| return cons[0],
-//         //     else => @panic("car only works on a cons"),
-//         // }
-//     }
-
-//     pub fn cdr(x: Value) *Value {
-//         return x.CONS[1];
-//         // switch (x) {
-//         //     .CONS => |cons| return cons[1],
-//         //     else => @panic("cdr only works on a cons"),
-//         // }
-//     }
-
-//     pub fn truthy(x: Value) bool {
-//         return switch (x) {
-//             .FALSE, .NIL => false,
-//             else => true,
-//         };
-//     }
-
-//     pub fn is_nil(x: Value) bool {
-//         return switch (x) {
-//             .NIL => true,
-//             else => false,
-//         };
-//     }
-
-//     pub fn print(x: Value) void {
-//         switch (x) {
-//             .NUMBER => |y| std.debug.print("{}", .{y}),
-//             .CONS => {
-//                 std.debug.print("(", .{});
-//                 car(x).print();
-//                 std.debug.print(" ", .{});
-//                 cdr(x).print();
-//                 std.debug.print(")", .{});
-//             },
-//             else => std.debug.print("<{}>", .{x}),
-//         }
-//     }
-// };
-
-// // pub const RibFieldType = enum {
-// //     TYPE, // makes more sense to let enums be separate rather than encoded in numbers
-// //     OP, // same for the opcode enum
-// //     RIB,
-// //     NAT,
-// //     // REAL,
-// // };
-
-// // // TODO benchmark union vs extern union
-// // // and probably use extern union in ReleaseFast/Small
-// // // but union in Debug/ReleaseSafe
-// // pub const RibField = union {
-// //     type: ObjectType,
-// //     op: Opcode,
-// //     rib: *Rib,
-// //     nat: u64,
-// //     // real: q.Q,
-// // };
-
-// // pub const ObjectType = enum {
-// //     PAIR,
-// //     PROCEDURE,
-// //     SYMBOL,
-// //     STRING,
-// //     VECTOR,
-// //     SPECIAL,
-// // };
-
-// // // NOTE out of band storage of types makes the extern union based struct significantly smaller
-// // // but i think alignment means there's no point to compacting them further
-// // pub const Rib = struct {
-// //     car: RibField,
-// //     cdr: RibField,
-// //     tag: RibField,
-// //     car_t: RibFieldType,
-// //     cdr_t: RibFieldType,
-// //     tag_t: RibFieldType,
-
-// //     // pub inline fn car_is(rib: Rib, t: RibFieldType) bool {
-// //     //     return rib.car_t == t;
-// //     // }
-// //     // pub inline fn cdr_is(rib: Rib, t: RibFieldType) bool {
-// //     //     return rib.cdr_t == t;
-// //     // }
-// //     // pub inline fn tag_is(rib: Rib, t: RibFieldType) bool {
-// //     //     return rib.tag_t == t;
-// //     // }
-
-// //     pub fn setCar(rib: *Rib, comptime t: RibFieldType, car: anytype) *Rib {
-// //         rib.car_t = t;
-// //         rib.car = switch (t) {
-// //             .TYPE => RibField{ .type = car },
-// //             .OP => RibField{ .op = car },
-// //             .RIB => RibField{ .rib = car },
-// //             .NAT => RibField{ .nat = car },
-// //         };
-// //         return rib;
-// //     }
-
-// //     pub fn setCdr(rib: *Rib, comptime t: RibFieldType, cdr: anytype) *Rib {
-// //         rib.cdr_t = t;
-// //         rib.cdr = switch (t) {
-// //             .TYPE => RibField{ .type = cdr },
-// //             .OP => RibField{ .op = cdr },
-// //             .RIB => RibField{ .rib = cdr },
-// //             .NAT => RibField{ .nat = cdr },
-// //         };
-// //         return rib;
-// //     }
-
-// //     pub fn setTag(rib: *Rib, comptime t: RibFieldType, tag: anytype) *Rib {
-// //         rib.tag_t = t;
-// //         rib.tag = switch (t) {
-// //             .TYPE => RibField{ .type = tag },
-// //             .OP => RibField{ .op = tag },
-// //             .RIB => RibField{ .rib = tag },
-// //             .NAT => RibField{ .nat = tag },
-// //         };
-// //         return rib;
-// //     }
-
-// //     pub fn format(
-// //         rib: Rib,
-// //         comptime fmt: []const u8,
-// //         options: std.fmt.FormatOptions,
-// //         writer: anytype,
-// //     ) !void {
-// //         _ = options;
-// //         _ = fmt;
-
-// //         // TODO fill in more as needed
-// //         switch (rib.tag_t) {
-// //             .TYPE => {
-// //                 switch (rib.tag.type) {
-// //                     // .PAIR => {},
-// //                     // .PROCEDURE => {},
-// //                     // .SYMBOL => {},
-// //                     // .STRING => {},
-// //                     // .VECTOR => {},
-// //                     .SPECIAL => {
-// //                         switch (rib.car.nat) {
-// //                             0 => try writer.print("nil", .{}),
-// //                             1 => try writer.print("#t", .{}),
-// //                             2 => try writer.print("#f", .{}),
-// //                             else => @panic("invalid special rib"),
-// //                         }
-// //                     },
-// //                     else => unreachable,
-// //                 }
-// //             },
-// //             // .OP => {},
-// //             // .RIB => {},
-// //             // .NAT => {},
-// //             else => unreachable,
-// //             // .RIB => |r| {
-// //             // try writer.print("<{} {} {}>", .{ self.car, self.cdr, r });
-// //             // },
-// //         }
-// //     }
-// // };
-
-// // pub const ValueType = enum {
-// //     CONS,
-// //     NUMBER,
-// //     STRING,
-// //     IDENTIFIER,
-// //     TRUE,
-// //     FALSE,
-// //     NIL,
-
-// //     NEXT,
-// // };
-// // pub const Value = union(ValueType) {
-// //     CONS: [*]Value, // pointer to a length 2 array of values
-// //     NUMBER: q.Q, // fixed point number
-// //     STRING: u32, // key into interning table?
-// //     IDENTIFIER: u32, // key into interning table?
-// //     TRUE: void,
-// //     FALSE: void,
-// //     NIL: void,
-
-// //     NEXT: *Value, // for garbage collection
-
-// //     pub fn car(x: Value) Value {
-// //         return x.CONS[0];
-// //         // switch (x) {
-// //         //     .CONS => |cons| return cons[0],
-// //         //     else => @panic("car only works on a cons"),
-// //         // }
-// //     }
-
-// //     pub fn cdr(x: Value) Value {
-// //         return x.CONS[1];
-// //         // switch (x) {
-// //         //     .CONS => |cons| return cons[1],
-// //         //     else => @panic("cdr only works on a cons"),
-// //         // }
-// //     }
-
-// //     pub fn truthy(x: Value) bool {
-// //         return switch (x) {
-// //             .FALSE, .NIL => false,
-// //             else => true,
-// //         };
-// //     }
-
-// //     pub fn is_nil(x: Value) bool {
-// //         return switch (x) {
-// //             .NIL => true,
-// //             else => false,
-// //         };
-// //     }
-
-// //     pub fn print(x: Value) void {
-// //         switch (x) {
-// //             .NUMBER => |y| std.debug.print("{}", .{y}),
-// //             .CONS => {
-// //                 std.debug.print("(", .{});
-// //                 car(x).print();
-// //                 std.debug.print(" ", .{});
-// //                 cdr(x).print();
-// //                 std.debug.print(")", .{});
-// //             },
-// //             else => std.debug.print("<{}>", .{x}),
-// //         }
-// //     }
-// // };
