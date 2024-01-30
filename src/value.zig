@@ -67,8 +67,9 @@ pub const Val = struct {
         return v.val.cons[1];
     }
 
-    pub fn get(v: Val) *Val {
-        std.debug.assert(v.tag == .map);
+    pub fn get(m: Val, k: *Val) *Val {
+        std.debug.assert(m.tag == .map);
+        _ = k;
     }
 
     pub fn assoc(m: Val, gc: *GC, k: *Val, v: *Val) *Val {
@@ -84,8 +85,7 @@ pub const Val = struct {
             n.val.map.root = Block.make_map_leaf(gc);
         } else {
             // otherwise, copy the root, preserving the old map
-            n.val.map.root = gc.create(Block);
-            n.val.map.root.?.* = m.val.map.root.?.*;
+            n.val.map.root = n.val.map.root.?.shallow_copy(gc);
         }
 
         // then insert into that new/copied root
@@ -180,7 +180,10 @@ pub const Val = struct {
     }
 };
 
-pub fn eql(a: Val, b: Val) bool {
+pub fn eql(a: *const Val, b: *const Val) bool {
+    if (a == b) {
+        return true;
+    }
     if (a.tag != b.tag) {
         return false;
     }
@@ -188,11 +191,11 @@ pub fn eql(a: Val, b: Val) bool {
         return false;
     }
 
-    return switch (a) {
-        .nat => a.nat == b.nat,
-        .cons => eql(a.car().*, b.car().*) and eql(a.car().*, b.car().*),
+    return switch (a.tag) {
+        .nat => a.val.nat == b.val.nat,
+        .cons => eql(a.car(), b.car()) and eql(a.car(), b.car()),
         .map => @panic("not implemented"),
-        .primitive => a.primitive == b.primitive,
+        .primitive => a.val.primitive == b.val.primitive,
         .true, .false, .nil => true, // payload free Vals are equal if the tag is equal
     };
 }
@@ -229,24 +232,22 @@ pub const Block = struct {
     }
 
     fn assoc(walk: *Block, gc: *GC, kv: *Val, depth: u5) *Block {
+        // probably deal with this case by having a list of kvs at depth 10
+        if (depth == 10) @panic("hamt depth exceeded (hash collision?)"); // TODO
+
         // in the case that we're inserting into a full leaf
         // that is not at bottom level
         // return a new node in the tree
         // otherwise, return walk
-        const loc = (kv.hash >> (3 * depth)) & 0x7;
-        std.debug.print("in block assoc, loc={} depth={}\n", .{ loc, depth });
+        const loc = (kv.car().hash >> (3 * depth)) & 0x7;
         switch (walk.tag) {
             .map_node => {
-                std.debug.print("  map_node ", .{});
                 if (walk.block.map_node[loc] == null) {
-                    std.debug.print("null\n", .{});
                     // create a new empty leaf
                     walk.block.map_node[loc] = Block.make_map_leaf(gc);
                 } else {
-                    std.debug.print("copy\n", .{});
                     // copy existing block (node or leaf)
-                    const new_leaf = gc.create(Block);
-                    new_leaf.* = walk.block.map_node[loc].?.*;
+                    const new_leaf = walk.block.map_node[loc].?.shallow_copy(gc);
                     walk.block.map_node[loc] = new_leaf;
                 }
                 // then insert into the new leaf or copied node/leaf
@@ -255,15 +256,17 @@ pub const Block = struct {
                 return new;
             },
             .map_leaf => {
-                std.debug.print("  map_leaf ", .{});
                 if (walk.block.map_leaf[loc] == null) {
-                    std.debug.print("null\n", .{});
                     // slot is empty, just insert
                     walk.block.map_leaf[loc] = kv;
                     walk._hash();
                     return walk;
+                } else if (eql(walk.block.map_leaf[loc].?.car(), kv.car())) {
+                    // key is already in map, replace val
+                    walk.block.map_leaf[loc] = kv;
+                    walk._hash();
+                    return walk;
                 } else {
-                    std.debug.print("transfer\n", .{});
                     // create a new node and transfer existing kv
                     var new_node = Block.make_map_node(gc);
                     for (walk.block.map_leaf) |_kv| {
@@ -278,6 +281,24 @@ pub const Block = struct {
                 }
             },
         }
+    }
+
+    fn shallow_copy(b: Block, gc: *GC) *Block {
+        switch (b.tag) {
+            .map_node, .map_leaf => {
+                const new = gc.create(Block);
+                new.* = b;
+                return new;
+            },
+        }
+
+        unreachable;
+    }
+
+    fn deep_copy(b: Block, gc: *GC) *Block {
+        _ = b;
+        _ = gc;
+        @compileError("TODO: implement");
     }
 
     fn _hash(b: *Block) void {
@@ -363,4 +384,8 @@ test "map" {
     std.debug.print("{*}\n", .{m2.val.map.root});
     std.debug.print("{}\n", .{m2.val.map.root.?.*});
     std.debug.print("{} {}\n", .{ m2.hash, m2.val.map.len });
+    const m3 = m2.assoc(&gc, Val.make_nat(&gc, 234), Val.make_nat(&gc, 432));
+    std.debug.print("{*}\n", .{m3.val.map.root});
+    std.debug.print("{}\n", .{m3.val.map.root.?.*});
+    std.debug.print("{} {}\n", .{ m3.hash, m3.val.map.len });
 }
