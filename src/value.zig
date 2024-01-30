@@ -79,10 +79,16 @@ pub const Val = struct {
         n.val.map.len += 1;
 
         if (m.val.map.len == 0) {
+            // if map is empty, create a first leaf node
             std.debug.assert(m.val.map.root == null);
             n.val.map.root = Block.make_map_leaf(gc);
+        } else {
+            // otherwise, copy the root, preserving the old map
+            n.val.map.root = gc.create(Block);
+            n.val.map.root.?.* = m.val.map.root.?.*;
         }
 
+        // then insert into that new/copied root
         const kv = make_cons(gc, k, v);
         n.val.map.root = n.val.map.root.?.assoc(gc, kv, 0);
         n._hash();
