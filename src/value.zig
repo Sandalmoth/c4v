@@ -85,6 +85,7 @@ pub const Val = struct {
 
         const kv = make_cons(gc, k, v);
         n.val.map.root = n.val.map.root.?.assoc(gc, kv, 0);
+        n._hash();
         return n;
     }
 
@@ -227,26 +228,36 @@ pub const Block = struct {
         // return a new node in the tree
         // otherwise, return walk
         const loc = (kv.hash >> (3 * depth)) & 0x7;
+        std.debug.print("in block assoc, loc={} depth={}\n", .{ loc, depth });
         switch (walk.tag) {
             .map_node => {
+                std.debug.print("  map_node ", .{});
                 if (walk.block.map_node[loc] == null) {
+                    std.debug.print("null\n", .{});
                     // create a new empty leaf
                     walk.block.map_node[loc] = Block.make_map_leaf(gc);
                 } else {
+                    std.debug.print("copy\n", .{});
                     // copy existing block (node or leaf)
                     const new_leaf = gc.create(Block);
                     new_leaf.* = walk.block.map_node[loc].?.*;
                     walk.block.map_node[loc] = new_leaf;
                 }
                 // then insert into the new leaf or copied node/leaf
-                return walk.block.map_node[loc].?.assoc(gc, kv, depth + 1);
+                var new = walk.block.map_node[loc].?.assoc(gc, kv, depth + 1);
+                new._hash();
+                return new;
             },
             .map_leaf => {
+                std.debug.print("  map_leaf ", .{});
                 if (walk.block.map_leaf[loc] == null) {
+                    std.debug.print("null\n", .{});
                     // slot is empty, just insert
                     walk.block.map_leaf[loc] = kv;
+                    walk._hash();
                     return walk;
                 } else {
+                    std.debug.print("transfer\n", .{});
                     // create a new node and transfer existing kv
                     var new_node = Block.make_map_node(gc);
                     for (walk.block.map_leaf) |_kv| {
@@ -256,6 +267,7 @@ pub const Block = struct {
                     }
                     // finally, insert our kv into that
                     new_node = new_node.assoc(gc, kv, depth + 1);
+                    new_node._hash();
                     return new_node;
                 }
             },
@@ -268,7 +280,7 @@ pub const Block = struct {
                 var h: u32 = 0;
                 for (b.block.map_node) |n| {
                     if (n != null) {
-                        h = h & n.?.hash;
+                        h = h ^ n.?.hash;
                     }
                 }
                 break :blk h;
@@ -277,7 +289,7 @@ pub const Block = struct {
                 var h: u32 = 0;
                 for (b.block.map_leaf) |l| {
                     if (l != null) {
-                        h = h & l.?.hash;
+                        h = h ^ l.?.hash;
                     }
                 }
                 break :blk h;
@@ -335,9 +347,14 @@ test "map" {
     defer gc.deinit();
 
     const m0 = Val.make_map(&gc);
-    std.debug.print("{}\n", .{m0.hash});
+    std.debug.print("{*}\n", .{m0.val.map.root});
+    std.debug.print("{} {}\n", .{ m0.hash, m0.val.map.len });
     const m1 = m0.assoc(&gc, Val.make_nat(&gc, 123), Val.make_nat(&gc, 321));
-    std.debug.print("{}\n", .{m1.hash});
+    std.debug.print("{*}\n", .{m1.val.map.root});
+    std.debug.print("{}\n", .{m1.val.map.root.?.*});
+    std.debug.print("{} {}\n", .{ m1.hash, m1.val.map.len });
     const m2 = m1.assoc(&gc, Val.make_nat(&gc, 234), Val.make_nat(&gc, 432));
-    std.debug.print("{}\n", .{m2.hash});
+    std.debug.print("{*}\n", .{m2.val.map.root});
+    std.debug.print("{}\n", .{m2.val.map.root.?.*});
+    std.debug.print("{} {}\n", .{ m2.hash, m2.val.map.len });
 }
