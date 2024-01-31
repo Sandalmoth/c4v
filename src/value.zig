@@ -190,8 +190,10 @@ pub const Val = struct {
             .nat => std.fmt.format(writer, "{}", .{x.val.nat}),
             .cons => std.fmt.format(writer, "({} {})", .{ x.car(), x.cdr() }),
             .map => {
-                try std.fmt.format(writer, "{{", .{});
-                try std.fmt.format(writer, "TODO", .{});
+                try std.fmt.format(writer, "{{ ", .{});
+                if (x.val.map.root) |root| {
+                    try std.fmt.format(writer, "{}", .{root});
+                }
                 try std.fmt.format(writer, "}}", .{});
             },
             .primitive => std.fmt.format(writer, "<primitive>", .{}),
@@ -382,6 +384,25 @@ pub const Block = struct {
     //         else => {},
     //     }
     // }
+
+    pub fn format(x: Block, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (x.tag) {
+            .map_node => {
+                for (x.block.map_node) |n| {
+                    if (n == null) continue;
+                    try std.fmt.format(writer, "{}", .{n.?});
+                }
+            },
+            .map_leaf => {
+                for (x.block.map_leaf) |l| {
+                    if (l == null) continue;
+                    try std.fmt.format(writer, "{} {} ", .{ l.?.car(), l.?.cdr() });
+                }
+            },
+        }
+    }
 };
 
 comptime {
@@ -457,4 +478,9 @@ test "map" {
     std.debug.print("123 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 123))});
     std.debug.print("234 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 234))});
     std.debug.print("345 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 345))});
+
+    std.debug.print("{}\n", .{m0});
+    std.debug.print("{}\n", .{m1});
+    std.debug.print("{}\n", .{m2});
+    std.debug.print("{}\n", .{m3});
 }
