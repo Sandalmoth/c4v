@@ -67,9 +67,13 @@ pub const Val = struct {
         return v.val.cons[1];
     }
 
-    pub fn get(m: Val, k: *Val) *Val {
+    pub fn get(m: Val, gc: *GC, k: *Val) *Val {
         std.debug.assert(m.tag == .map);
-        _ = k;
+        if (m.val.map.len == 0) {
+            return Val.make_nil(gc);
+        }
+        std.debug.assert(m.val.map.root != null);
+        return m.val.map.root.?.get(gc, k, 0);
     }
 
     pub fn assoc(m: Val, gc: *GC, k: *Val, v: *Val) *Val {
@@ -178,6 +182,24 @@ pub const Val = struct {
             else => {},
         }
     }
+
+    pub fn format(x: Val, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try switch (x.tag) {
+            .nat => std.fmt.format(writer, "{}", .{x.val.nat}),
+            .cons => std.fmt.format(writer, "({} {})", .{ x.car(), x.cdr() }),
+            .map => {
+                try std.fmt.format(writer, "{{", .{});
+                try std.fmt.format(writer, "TODO", .{});
+                try std.fmt.format(writer, "}}", .{});
+            },
+            .primitive => std.fmt.format(writer, "<primitive>", .{}),
+            .true => std.fmt.format(writer, "true", .{}),
+            .false => std.fmt.format(writer, "false", .{}),
+            .nil => std.fmt.format(writer, "nil", .{}),
+        };
+    }
 };
 
 pub fn eql(a: *const Val, b: *const Val) bool {
@@ -229,6 +251,28 @@ pub const Block = struct {
         b.* = .{ .tag = .map_leaf, .block = .{ .map_leaf = [_]?*Val{null} ** 8 } };
         b._hash();
         return b;
+    }
+
+    fn get(walk: *Block, gc: *GC, k: *Val, depth: u5) *Val {
+        const loc = (k.hash >> (3 * depth)) & 0x7;
+        switch (walk.tag) {
+            .map_node => {
+                if (walk.block.map_node[loc] == null) {
+                    return Val.make_nil(gc);
+                } else {
+                    return walk.block.map_node[loc].?.get(gc, k, depth + 1);
+                }
+            },
+            .map_leaf => {
+                if (walk.block.map_leaf[loc] == null) {
+                    return Val.make_nil(gc);
+                } else if (eql(walk.block.map_leaf[loc].?.car(), k)) {
+                    return walk.block.map_leaf[loc].?.cdr();
+                } else {
+                    return Val.make_nil(gc);
+                }
+            },
+        }
     }
 
     fn assoc(walk: *Block, gc: *GC, kv: *Val, depth: u5) *Block {
@@ -367,6 +411,15 @@ test "hash" {
     // try std.testing.expectEqual(@as(u32, 4087041917), v_cons.hash);
 }
 
+test "printing" {
+    var gc = try GC.init(std.testing.allocator);
+    defer gc.deinit();
+    std.debug.print("\n", .{});
+    std.debug.print("{}\n", .{Val.make_nat(&gc, 123)});
+    std.debug.print("{}\n", .{Val.make_cons(&gc, Val.make_true(&gc), Val.make_false(&gc))});
+    std.debug.print("{}\n", .{Val.make_nil(&gc)});
+}
+
 test "map" {
     std.debug.print("\n", .{});
 
@@ -388,4 +441,20 @@ test "map" {
     std.debug.print("{*}\n", .{m3.val.map.root});
     std.debug.print("{}\n", .{m3.val.map.root.?.*});
     std.debug.print("{} {}\n", .{ m3.hash, m3.val.map.len });
+
+    std.debug.print("123 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 123))});
+    std.debug.print("234 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 234))});
+    std.debug.print("345 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 345))});
+
+    std.debug.print("123 -> {}\n", .{m1.get(&gc, Val.make_nat(&gc, 123))});
+    std.debug.print("234 -> {}\n", .{m1.get(&gc, Val.make_nat(&gc, 234))});
+    std.debug.print("345 -> {}\n", .{m1.get(&gc, Val.make_nat(&gc, 345))});
+
+    std.debug.print("123 -> {}\n", .{m2.get(&gc, Val.make_nat(&gc, 123))});
+    std.debug.print("234 -> {}\n", .{m2.get(&gc, Val.make_nat(&gc, 234))});
+    std.debug.print("345 -> {}\n", .{m2.get(&gc, Val.make_nat(&gc, 345))});
+
+    std.debug.print("123 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 123))});
+    std.debug.print("234 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 234))});
+    std.debug.print("345 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 345))});
 }
