@@ -99,6 +99,23 @@ pub const Val = struct {
         return n;
     }
 
+    pub fn dissoc(m: *Val, gc: *GC, k: *Val) *Val {
+        std.debug.assert(m.tag == .map);
+        // kinda inefficient to traverse twice?
+        const v = m.get(gc, k);
+        if (v.tag == .nil) return m;
+        std.debug.assert(m.val.map.len > 0);
+        std.debug.assert(m.val.map.root != null);
+
+        const n = make_map(gc);
+        n.* = m.*;
+        n.val.map.len -= 1;
+        n.val.map.root = n.val.map.root.?.shallow_copy(gc);
+        n.val.map.root.?.dissoc(gc, k, 0);
+        n._hash();
+        return n;
+    }
+
     pub fn truthy(v: Val) bool {
         return switch (v.tag) {
             .false, .nil => false,
@@ -329,6 +346,22 @@ pub const Block = struct {
         }
     }
 
+    fn dissoc(walk: *Block, gc: *GC, k: *Val, depth: u5) void {
+        // NOTE when calling this, we already know that the key exists
+        const loc = (k.hash >> (3 * depth)) & 0x7;
+        switch (walk.tag) {
+            .map_node => {
+                std.debug.assert(walk.block.map_node[loc] != null);
+                walk.block.map_node[loc] = walk.block.map_node[loc].?.shallow_copy(gc);
+                walk.block.map_node[loc].?.dissoc(gc, k, depth + 1);
+            },
+            .map_leaf => {
+                std.debug.assert(eql(walk.block.map_leaf[loc].?.car(), k));
+                walk.block.map_leaf[loc] = null;
+            },
+        }
+    }
+
     fn shallow_copy(b: Block, gc: *GC) *Block {
         switch (b.tag) {
             .map_node, .map_leaf => {
@@ -463,6 +496,11 @@ test "map" {
     std.debug.print("{}\n", .{m3.val.map.root.?.*});
     std.debug.print("{} {}\n", .{ m3.hash, m3.val.map.len });
 
+    const m4 = m3.dissoc(&gc, Val.make_nat(&gc, 234));
+    std.debug.print("{*}\n", .{m4.val.map.root});
+    std.debug.print("{}\n", .{m4.val.map.root.?.*});
+    std.debug.print("{} {}\n", .{ m4.hash, m4.val.map.len });
+
     std.debug.print("123 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 123))});
     std.debug.print("234 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 234))});
     std.debug.print("345 -> {}\n", .{m0.get(&gc, Val.make_nat(&gc, 345))});
@@ -479,8 +517,13 @@ test "map" {
     std.debug.print("234 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 234))});
     std.debug.print("345 -> {}\n", .{m3.get(&gc, Val.make_nat(&gc, 345))});
 
+    std.debug.print("123 -> {}\n", .{m4.get(&gc, Val.make_nat(&gc, 123))});
+    std.debug.print("234 -> {}\n", .{m4.get(&gc, Val.make_nat(&gc, 234))});
+    std.debug.print("345 -> {}\n", .{m4.get(&gc, Val.make_nat(&gc, 345))});
+
     std.debug.print("{}\n", .{m0});
     std.debug.print("{}\n", .{m1});
     std.debug.print("{}\n", .{m2});
     std.debug.print("{}\n", .{m3});
+    std.debug.print("{}\n", .{m4});
 }
