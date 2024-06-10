@@ -26,11 +26,13 @@ pub fn Pool(comptime T: type) type {
             pool.arena.deinit();
         }
 
-        pub fn create(pool: *Self) !*T {
+        pub fn create(pool: *Self) *T {
             const node = if (pool.free_list) |item| blk: {
                 pool.free_list = item.next;
                 break :blk item;
-            } else try pool.arena.allocator().create(Node);
+            } else pool.arena.allocator().create(Node) catch @panic(
+                "Pool <" ++ @typeName(T) ++ ">: out of memory",
+            );
 
             node.* = Node{ .item = undefined };
             return @alignCast(@ptrCast(node));
@@ -50,9 +52,9 @@ test "memory pool: basic" {
     var pool = Pool(u32).init(std.testing.allocator);
     defer pool.deinit();
 
-    const p1 = try pool.create();
-    const p2 = try pool.create();
-    const p3 = try pool.create();
+    const p1 = pool.create();
+    const p2 = pool.create();
+    const p3 = pool.create();
 
     // Assert uniqueness
     try std.testing.expect(p1 != p2);
@@ -60,7 +62,7 @@ test "memory pool: basic" {
     try std.testing.expect(p2 != p3);
 
     pool.destroy(p2);
-    const p4 = try pool.create();
+    const p4 = pool.create();
 
     // Assert memory reuse
     try std.testing.expect(p2 == p4);

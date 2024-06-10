@@ -10,8 +10,11 @@ const Pool = @import("pool.zig").Pool;
 // this implementation is significantly different
 // and makes no attempt to be compatible
 
-const Rib = @import("value.zig").Rib;
-const RibField = @import("value.zig").RibField;
+const Value = @import("value.zig").Value;
+const Vtype = @import("value.zig").Vtype;
+
+// const Rib = @import("value.zig").Rib;
+// const RibField = @import("value.zig").RibField;
 
 pub const Opcode = enum {
     JUMP_CALL,
@@ -28,33 +31,35 @@ pub const VMError = error{ RuntimeError, OutOfMemory };
 
 pub const VM = struct {
     alloc: std.mem.Allocator,
-    pool: Pool(Rib), // NOTE the pool guarantees reference stability
 
-    nil: *Rib = undefined,
-    true: *Rib = undefined,
-    false: *Rib = undefined,
+    // NOTE the pool guarantees pointer stability
+    pool: Pool(Value),
 
-    symbols: *Rib = undefined,
-    stack: *Rib = undefined, // i think this is better as a *Rib than a RibField?
-    pc: *Rib = undefined,
+    // nil: *Rib = undefined,
+    // true: *Rib = undefined,
+    // false: *Rib = undefined,
 
-    referenced: *Rib = undefined, // a list of values that have external handles
+    // symbols: *Rib = undefined,
+    stack: *Value = undefined, // i think this is better as a *Rib than a RibField?
+    pc: *Value = undefined,
+
+    // referenced: *Rib = undefined, // a list of values that have external handles
 
     pub fn init(alloc: std.mem.Allocator) !VM {
         var vm = VM{
             .alloc = alloc,
-            .pool = Pool(Rib).init(alloc),
+            .pool = Pool(Value).init(alloc),
         };
         errdefer vm.pool.deinit();
 
         // NOTE the car values are just for printing
-        vm.nil = (try vm.createSpecial()).setCar(.NAT, 0);
-        vm.true = (try vm.createSpecial()).setCar(.NAT, 1);
-        vm.false = (try vm.createSpecial()).setCar(.NAT, 2);
+        // vm.nil = (try vm.createSpecial()).setCar(.NAT, 0);
+        // vm.true = (try vm.createSpecial()).setCar(.NAT, 1);
+        // vm.false = (try vm.createSpecial()).setCar(.NAT, 2);
 
-        vm.symbols = vm.nil;
-        vm.stack = vm.nil; // TODO consider what the best option is here
-        vm.pc = vm.nil;
+        // vm.symbols = vm.nil;
+        vm.stack = undefined; // TODO consider what the best option is here
+        // vm.pc = vm.nil;
 
         return vm;
     }
@@ -70,14 +75,29 @@ pub const VM = struct {
         _ = vm;
     }
 
-    pub fn exec(vm: *VM, prog: *Rib) !void {
+    pub fn new(vm: *VM, comptime t: Vtype) *Value {
+        var v = vm.pool.create();
+        // I wonder if there is a cleaner way to activate the field?
+        v.* = switch (t) {
+            .INSTR => Value{ .INSTR = undefined },
+            .CONS => Value{ .CONS = undefined },
+            .NAT => Value{ .NAT = undefined },
+            .TRUE => Value{ .TRUE = {} },
+            .FALSE => Value{ .FALSE = {} },
+            .NIL => Value{ .NIL = {} },
+        };
+        return v;
+    }
+
+    pub fn exec(vm: *VM, prog: *Value) !void {
+        std.debug.assert(prog.* == .INSTR);
         vm.pc = prog;
         try vm.dispatch();
     }
 
     fn dispatch(vm: *VM) VMError!void {
-        std.debug.assert(vm.pc.car_t == .OP);
-        const op = vm.pc.car.op;
+        std.debug.assert(vm.pc.* == .INSTR);
+        const op = vm.pc.INSTR.op;
         return switch (op) {
             .JUMP_CALL => {},
             .SET => {},
@@ -95,15 +115,6 @@ pub const VM = struct {
         vm.pc = vm.pc.tag.rib;
         try @call(.always_tail, dispatch, .{vm});
     }
-
-    fn createSpecial(vm: *VM) !*Rib {
-        return (try vm.newRib()).setTag(.TYPE, .SPECIAL);
-    }
-
-    fn newRib(vm: *VM) !*Rib {
-        // because our gc is manual only, this cannot trigger a gc
-        return vm.pool.create();
-    }
 };
 
 test "init deinit" {
@@ -115,7 +126,8 @@ test "halt" {
     var vm = try VM.init(std.testing.allocator);
     defer vm.deinit();
 
-    var program = (try vm.newRib()).setCar(.OP, .HALT);
+    var program = vm.new(.INSTR);
+    program.INSTR.op = .HALT;
     try vm.exec(program);
 }
 
@@ -124,10 +136,10 @@ test "DEBUG_PRINT" {
     defer vm.deinit();
 
     // we build the program end to start for simplicity
-    var program = (try vm.newRib()).setCar(.OP, .HALT);
-    program = (try vm.newRib()).setCar(.OP, .DEBUG_PRINT).setTag(.RIB, program);
+    // var program = (try vm.newRib()).setCar(.OP, .HALT);
+    // program = (try vm.newRib()).setCar(.OP, .DEBUG_PRINT).setTag(.RIB, program);
 
-    try vm.exec(program);
+    // try vm.exec(program);
 }
 
 // const Value = @import("value.zig").Value;

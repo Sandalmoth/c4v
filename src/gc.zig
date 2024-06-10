@@ -57,6 +57,7 @@ pub fn GarbageCollector(comptime config: Config) type {
         }
 
         pub fn create(gc: *GC, comptime T: type) *T {
+            // TODO handle out of memory?
             if (@alignOf(T) <= config.unit) {
                 const p = gc.free;
                 gc.free += roundup(@sizeOf(T), config.unit);
