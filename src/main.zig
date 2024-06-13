@@ -55,6 +55,7 @@ const Box = struct {
             .cons => |cons| blk: {
                 var h: u32 = 0;
                 h ^= if (cons.car == nil) NILHASH else vm.boxPtr(cons.car).hash;
+                h *%= 91;
                 h ^= if (cons.cdr == nil) NILHASH else vm.boxPtr(cons.cdr).hash;
                 break :blk h;
             },
@@ -62,7 +63,7 @@ const Box = struct {
                 var h: u32 = 0;
                 for (hamt.children) |child| {
                     h ^= if (child == nil) NILHASH else vm.boxPtr(child).hash;
-                    h ^= vm.boxPtr(child).hash;
+                    h *%= 89;
                 }
                 break :blk h;
             },
@@ -73,6 +74,7 @@ const Box = struct {
         switch (box.data) {
             .real => std.debug.print("{}", .{box.data.real}),
             .cons => |cons| {
+                // TODO special case for list printing?
                 std.debug.print("(", .{});
                 if (cons.car == nil)
                     std.debug.print("nil", .{})
@@ -85,10 +87,38 @@ const Box = struct {
                     vm.boxPtr(cons.cdr)._debugPrint(vm);
                 std.debug.print(")", .{});
             },
-            .hamt => |hamt| {
-                _ = hamt;
-                std.debug.print("[HAMT]", .{});
+            .hamt => {
+                std.debug.print("{{", .{});
+                box._debugPrintHamtImpl(vm);
+                std.debug.print("}}", .{});
             },
+        }
+    }
+
+    fn _debugPrintHamtImpl(box: *Box, vm: *VM) void {
+        const hamt = box.data.hamt;
+
+        for (hamt.children) |child| {
+            if (child == nil) continue;
+            const x = vm.boxPtr(child);
+            switch (x.data) {
+                .cons => |cons| {
+                    if (cons.car == nil)
+                        std.debug.print("nil", .{})
+                    else
+                        vm.boxPtr(cons.car)._debugPrint(vm);
+                    std.debug.print(" ", .{});
+                    if (cons.cdr == nil)
+                        std.debug.print("nil", .{})
+                    else
+                        vm.boxPtr(cons.cdr)._debugPrint(vm);
+                },
+                .hamt => {
+                    x._debugPrintHamtImpl(vm);
+                },
+                else => unreachable,
+            }
+            std.debug.print(" ", .{});
         }
     }
 };
@@ -143,6 +173,21 @@ const VM = struct {
         return ref;
     }
 
+    fn newHamt(vm: *VM, c0: u32, c1: u32, c2: u32, c3: u32) u32 {
+        const ref = vm.new();
+        const box = vm.boxPtr(ref);
+        vm.obtain(c0);
+        vm.obtain(c1);
+        vm.obtain(c2);
+        vm.obtain(c3);
+        box.data = Data{ .hamt = .{
+            .children = .{ c0, c1, c2, c3 },
+            .leaf = true,
+        } };
+        box._hash(vm);
+        return ref;
+    }
+
     /// add a reference to an existing box
     fn obtain(vm: *VM, ref: u32) void {
         if (ref == nil) return;
@@ -167,7 +212,7 @@ const VM = struct {
 
     fn debugPrint(vm: *VM, ref: u32) void {
         if (ref == nil) std.debug.print("nil", .{});
-        vm.boxPtr(ref)._debugPrint(vm); // i kinda just want all the box variant code in one place
+        vm.boxPtr(ref)._debugPrint(vm);
         std.debug.print("\n", .{});
     }
 };
@@ -183,51 +228,8 @@ pub fn main() !void {
     defer vm.deinit();
 
     const a = vm.newReal(1.0);
-    std.debug.print("{}\n", .{a});
-    std.debug.print("{}\n", .{vm.boxPtr(a)});
-
     const b = vm.newReal(2.0);
-    std.debug.print("{}\n", .{b});
-    std.debug.print("{}\n", .{vm.boxPtr(b)});
 
-    const c = vm.newCons(a, b);
-    std.debug.print("{}\n", .{c});
-    std.debug.print("{}\n", .{vm.boxPtr(c)});
-    vm.debugPrint(c);
-
-    std.debug.print("{}\n", .{vm.boxPtr(a)});
-    std.debug.print("{}\n", .{vm.boxPtr(b)});
-
-    vm.release(c);
-
-    std.debug.print("{}\n", .{vm.boxPtr(a)});
-    std.debug.print("{}\n", .{vm.boxPtr(b)});
-
-    const d = vm.newReal(3.0);
-    std.debug.print("{}\n", .{d});
-    std.debug.print("{}\n", .{vm.boxPtr(d)});
-
-    std.debug.print("{}\n", .{vm.boxPtr(a)});
-    std.debug.print("{}\n", .{vm.boxPtr(b)});
-
-    vm.release(a);
-    vm.release(b);
-
-    const e = vm.newCons(d, nil);
-    std.debug.print("{}\n", .{e});
-    std.debug.print("{}\n", .{vm.boxPtr(e)});
-    vm.debugPrint(e);
-
-    vm.release(e);
-
-    const f = vm.newReal(4.0);
-    std.debug.print("{}\n", .{f});
-    std.debug.print("{}\n", .{vm.boxPtr(f)});
-
-    const g = vm.newReal(5.0);
-    std.debug.print("{}\n", .{g});
-    std.debug.print("{}\n", .{vm.boxPtr(g)});
-
-    vm.release(f);
-    vm.release(g);
+    const m = vm.newHamt(nil, vm.newCons(a, b), nil, nil);
+    vm.debugPrint(m);
 }
