@@ -68,6 +68,29 @@ const Box = struct {
             },
         };
     }
+
+    fn _debugPrint(box: *Box, vm: *VM) void {
+        switch (box.data) {
+            .real => std.debug.print("{}", .{box.data.real}),
+            .cons => |cons| {
+                std.debug.print("(", .{});
+                if (cons.car == nil)
+                    std.debug.print("nil", .{})
+                else
+                    vm.boxPtr(cons.car)._debugPrint(vm);
+                std.debug.print(" ", .{});
+                if (cons.cdr == nil)
+                    std.debug.print("nil", .{})
+                else
+                    vm.boxPtr(cons.cdr)._debugPrint(vm);
+                std.debug.print(")", .{});
+            },
+            .hamt => |hamt| {
+                _ = hamt;
+                std.debug.print("[HAMT]", .{});
+            },
+        }
+    }
 };
 
 const VM = struct {
@@ -141,6 +164,12 @@ const VM = struct {
         std.debug.assert(ref < vm.boxes.items.len);
         return &vm.boxes.items[ref];
     }
+
+    fn debugPrint(vm: *VM, ref: u32) void {
+        if (ref == nil) std.debug.print("nil", .{});
+        vm.boxPtr(ref)._debugPrint(vm); // i kinda just want all the box variant code in one place
+        std.debug.print("\n", .{});
+    }
 };
 
 pub fn main() !void {
@@ -164,6 +193,7 @@ pub fn main() !void {
     const c = vm.newCons(a, b);
     std.debug.print("{}\n", .{c});
     std.debug.print("{}\n", .{vm.boxPtr(c)});
+    vm.debugPrint(c);
 
     std.debug.print("{}\n", .{vm.boxPtr(a)});
     std.debug.print("{}\n", .{vm.boxPtr(b)});
@@ -186,6 +216,7 @@ pub fn main() !void {
     const e = vm.newCons(d, nil);
     std.debug.print("{}\n", .{e});
     std.debug.print("{}\n", .{vm.boxPtr(e)});
+    vm.debugPrint(e);
 
     vm.release(e);
 
