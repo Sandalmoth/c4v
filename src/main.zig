@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const nil = std.math.maxInt(u32);
+const NILHASH: u32 = 0xb4b4b4b4;
 
 const BOX_SIZE = 32;
 comptime {
@@ -11,6 +12,7 @@ comptime {
 const DataKind = enum {
     real,
     cons,
+    hamt,
 };
 
 const Data = union(DataKind) {
@@ -18,6 +20,10 @@ const Data = union(DataKind) {
     cons: struct {
         car: u32,
         cdr: u32,
+    },
+    hamt: struct {
+        children: [4]u32,
+        leaf: bool,
     },
 };
 
@@ -31,8 +37,14 @@ const Box = struct {
         switch (box.data) {
             .real => {},
             .cons => |cons| {
-                vm.release(cons.car);
-                vm.release(cons.cdr);
+                std.debug.print("{} {}\n", .{ cons.car, cons.cdr });
+                if (cons.car != nil) vm.release(cons.car);
+                if (cons.cdr != nil) vm.release(cons.cdr);
+            },
+            .hamt => |hamt| {
+                for (hamt.children) |child| {
+                    if (child != nil) vm.release(child);
+                }
             },
         }
     }
@@ -40,7 +52,20 @@ const Box = struct {
     fn _hash(box: *Box, vm: *VM) void {
         box.hash = switch (box.data) {
             .real => std.hash.XxHash32.hash(1337, std.mem.asBytes(&box.data.real)),
-            .cons => vm.boxPtr(box.data.cons.car).hash ^ vm.boxPtr(box.data.cons.cdr).hash,
+            .cons => |cons| blk: {
+                var h: u32 = 0;
+                h ^= if (cons.car == nil) NILHASH else vm.boxPtr(cons.car).hash;
+                h ^= if (cons.cdr == nil) NILHASH else vm.boxPtr(cons.cdr).hash;
+                break :blk h;
+            },
+            .hamt => |hamt| blk: {
+                var h: u32 = 0;
+                for (hamt.children) |child| {
+                    h ^= if (child == nil) NILHASH else vm.boxPtr(child).hash;
+                    h ^= vm.boxPtr(child).hash;
+                }
+                break :blk h;
+            },
         };
     }
 };
@@ -155,7 +180,23 @@ pub fn main() !void {
     std.debug.print("{}\n", .{vm.boxPtr(a)});
     std.debug.print("{}\n", .{vm.boxPtr(b)});
 
-    vm.release(d);
     vm.release(a);
     vm.release(b);
+
+    const e = vm.newCons(d, nil);
+    std.debug.print("{}\n", .{e});
+    std.debug.print("{}\n", .{vm.boxPtr(e)});
+
+    vm.release(e);
+
+    const f = vm.newReal(4.0);
+    std.debug.print("{}\n", .{f});
+    std.debug.print("{}\n", .{vm.boxPtr(f)});
+
+    const g = vm.newReal(5.0);
+    std.debug.print("{}\n", .{g});
+    std.debug.print("{}\n", .{vm.boxPtr(g)});
+
+    vm.release(f);
+    vm.release(g);
 }
