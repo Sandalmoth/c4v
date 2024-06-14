@@ -32,6 +32,47 @@ const Box = struct {
     hash: u32,
     data: Data,
 
+    fn assoc(box: *Box, keyref: u32, valref: u32, vm: *VM) u32 {
+        std.debug.assert(box.data == .hamt);
+        const key = vm.boxPtr(keyref);
+        const val = vm.boxPtr(valref);
+        vm.obtain(keyref);
+        vm.obtain(valref);
+
+        _ = val;
+
+        const root = vm.copyNoObtain(box);
+        var branch = root;
+        var walk = vm.boxPtr(branch);
+
+        var d: u32 = 0;
+        while (d < 16) : (d += 1) {
+            std.debug.print("{}\n", .{key.hash});
+            const i = (key.hash >> @intCast(d)) & 3;
+            std.debug.print("slot {} at depth {}\n", .{ i, d });
+            // vm.debugPrint(box.data.hamt.children[i]);
+
+            if (walk.data.hamt.children[i] == nil) {
+                walk.data.hamt.children[i] = vm.newCons(keyref, valref);
+                walk._hash();
+                // ugh but we need a stack here
+                // so we can walk back up and rehash at each level
+                // so recursion would be so much cleaner...
+                return root;
+            } else {
+                const next = vm.boxPtr(walk.data.hamt.children[i]);
+                if (next.data == .hamt) {
+                    walk = next;
+                    continue;
+                }
+
+                branch = 0; // TODO REPLACE
+                @panic("TODO");
+            }
+        }
+        @panic("hamt assoc hash collision");
+    }
+
     /// called by VM.release, do not call manually
     fn _release(box: *Box, vm: *VM) void {
         switch (box.data) {
@@ -80,7 +121,7 @@ const Box = struct {
                     std.debug.print("nil", .{})
                 else
                     vm.boxPtr(cons.car)._debugPrint(vm);
-                std.debug.print(" ", .{});
+                std.debug.print(" . ", .{});
                 if (cons.cdr == nil)
                     std.debug.print("nil", .{})
                 else
@@ -96,6 +137,7 @@ const Box = struct {
     }
 
     fn _debugPrintHamtImpl(box: *Box, vm: *VM) void {
+        std.debug.assert(box.data == .hamt);
         const hamt = box.data.hamt;
 
         for (hamt.children) |child| {
@@ -103,6 +145,7 @@ const Box = struct {
             const x = vm.boxPtr(child);
             switch (x.data) {
                 .cons => |cons| {
+                    // NOTE hashmaps can overflow
                     if (cons.car == nil)
                         std.debug.print("nil", .{})
                     else
@@ -188,6 +231,14 @@ const VM = struct {
         return ref;
     }
 
+    fn copyNoObtain(vm: *VM, box: *Box) u32 {
+        const ref = vm.new();
+        const copy = vm.boxPtr(ref);
+        copy.* = box.*;
+        copy.meta = 1;
+        return ref;
+    }
+
     /// add a reference to an existing box
     fn obtain(vm: *VM, ref: u32) void {
         if (ref == nil) return;
@@ -232,4 +283,8 @@ pub fn main() !void {
 
     const m = vm.newHamt(nil, vm.newCons(a, b), nil, nil);
     vm.debugPrint(m);
+
+    const m2 = vm.boxPtr(m).assoc(b, a, &vm);
+    vm.debugPrint(m);
+    vm.debugPrint(m2);
 }
