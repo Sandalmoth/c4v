@@ -133,10 +133,6 @@ const RT = struct {
     }
 
     fn hamtAssoc(rt: *RT, ref: Ref, keyref: Ref, valref: Ref) Ref {
-        std.debug.print("hamtassoc {} {} {}\n", .{ ref, keyref, valref });
-        // rt.debugPrint(ref);
-        // rt.debugPrint(keyref);
-        // rt.debugPrint(valref);
         std.debug.assert(rt.kindPtr(ref).* == .hamt);
         return rt._hamtAssocImpl(ref, keyref, valref, 0);
     }
@@ -153,32 +149,32 @@ const RT = struct {
         std.debug.assert(walk != ref);
         std.debug.assert(rt.kindPtr(walk).* == .hamt);
 
-        // std.debug.print(" --- {}\n", .{walk});
-        // std.debug.print("{} {}\n", .{ rt.hashPtr(keyref).*, i });
-
         for (0..8) |j| {
-            // std.debug.print("{} {}\n", .{ i, j });
             if (j != i) {
                 rt.obtain(walk_ptr.hamt.children[j]);
                 continue;
             }
 
             const child = walk_ptr.hamt.children[i];
-            // std.debug.print("{} {}\n", .{ j, child });
             if (child == nil) {
                 walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
-                std.debug.print("YOYO\n", .{});
-                rt.debugPrint(walk_ptr.hamt.children[i]);
-                std.debug.print("YOYO\n", .{});
             } else {
-                std.debug.print("COLLISION\n", .{});
+                // make a new subtree and insert
+                // - the thing we collided with
+                // - the new kv pair
+                std.debug.assert(rt.kindPtr(child).* == .cons);
+                const childptr = rt.objectPtr(child);
+                // using immutable modifications here is pretty inefficient though...
+                const h0 = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
+                const h1 = rt._hamtAssocImpl(h0, childptr.cons.car, childptr.cons.cdr, depth + 1);
+                const h2 = rt._hamtAssocImpl(h1, keyref, valref, depth + 1);
+                rt.release(h0);
+                rt.release(h1);
+                walk_ptr.hamt.children[i] = h2;
             }
         }
 
         rt._hash(walk);
-
-        std.debug.print("{any}\n", .{walk_ptr.hamt.children});
-
         return walk;
     }
 
@@ -293,19 +289,14 @@ const RT = struct {
         std.debug.assert(rt.kindPtr(ref).* == .hamt);
         const hamt = rt.objectPtr(ref).hamt;
 
-        // std.debug.print("{any}\n", .{hamt.children});
         for (hamt.children) |child| {
-            // std.debug.print("{}\n", .{child});
             if (child == nil) {
-                std.debug.print(", ", .{});
+                // std.debug.print(", ", .{});
                 continue;
             }
             switch (rt.kindPtr(child).*) {
                 .cons => {
                     const cons = rt.objectPtr(child).cons;
-                    // std.debug.print("{} {} {}\n", .{ child, cons.car, cons.cdr });
-                    // std.debug.print("{}\n", .{rt.kindPtr(cons.car)});
-                    // std.debug.print("{}\n", .{rt.kindPtr(cons.cdr)});
                     // NOTE hashmaps can overflow (TODO replace with a list if at max depth)
                     if (cons.car == nil)
                         std.debug.print("nil", .{})
