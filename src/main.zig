@@ -1,109 +1,176 @@
 const std = @import("std");
 
-const nil = std.math.maxInt(u32);
-const NILHASH: u32 = 0xb4b4b4b4;
+const OBJECT_SIZE = 32;
 
-const BOX_SIZE = 32;
-comptime {
-    // std.debug.assert(@sizeOf(Box) <= BLOCK_SIZE);
-    // std.debug.assert(@alignOf(Box) >= BLOCK_SIZE);
-}
+const Ref = u32;
+const nil = std.math.maxInt(Ref);
 
-const DataKind = enum {
+const Hash = u32;
+const NILHASH: Hash = 0xb4b4b4b4;
+
+const Meta = extern union {
+    next: Ref,
+    rc: u32,
+};
+
+const ObjectKind = enum {
     real,
     cons,
     hamt,
 };
 
-const Data = union(DataKind) {
+const Object = extern union {
     real: f64,
-    cons: struct {
-        car: u32,
-        cdr: u32,
+    cons: extern struct {
+        car: Ref,
+        cdr: Ref,
     },
-    hamt: struct {
-        children: [4]u32,
-        leaf: bool,
+    hamt: extern struct {
+        children: [8]Ref align(OBJECT_SIZE),
     },
 };
 
-const Box = struct {
-    meta: u32, // either a refcount or a pointer (i.e. index)
-    hash: u32,
-    data: Data,
+comptime {
+    std.debug.assert(@sizeOf(Object) <= OBJECT_SIZE);
+    std.debug.assert(@alignOf(Object) >= OBJECT_SIZE);
+}
 
-    fn assoc(box: *Box, keyref: u32, valref: u32, vm: *VM) u32 {
-        std.debug.assert(box.data == .hamt);
-        const key = vm.boxPtr(keyref);
-        const val = vm.boxPtr(valref);
-        vm.obtain(keyref);
-        vm.obtain(valref);
+const RT = struct {
+    metadata: std.ArrayList(Meta),
+    objects: std.ArrayList(Object),
+    hashes: std.ArrayList(Hash),
+    kinds: std.ArrayList(ObjectKind),
 
-        _ = val;
+    free_list: Ref = nil,
 
-        const root = vm.copyNoObtain(box);
-        var branch = root;
-        var walk = vm.boxPtr(branch);
-
-        var d: u32 = 0;
-        while (d < 16) : (d += 1) {
-            std.debug.print("{}\n", .{key.hash});
-            const i = (key.hash >> @intCast(d)) & 3;
-            std.debug.print("slot {} at depth {}\n", .{ i, d });
-            // vm.debugPrint(box.data.hamt.children[i]);
-
-            if (walk.data.hamt.children[i] == nil) {
-                walk.data.hamt.children[i] = vm.newCons(keyref, valref);
-                walk._hash();
-                // ugh but we need a stack here
-                // so we can walk back up and rehash at each level
-                // so recursion would be so much cleaner...
-                return root;
-            } else {
-                const next = vm.boxPtr(walk.data.hamt.children[i]);
-                if (next.data == .hamt) {
-                    walk = next;
-                    continue;
-                }
-
-                branch = 0; // TODO REPLACE
-                @panic("TODO");
-            }
-        }
-        @panic("hamt assoc hash collision");
+    fn init(alloc: std.mem.Allocator) RT {
+        return .{
+            .metadata = std.ArrayList(Meta).init(alloc),
+            .objects = std.ArrayList(Object).init(alloc),
+            .hashes = std.ArrayList(Hash).init(alloc),
+            .kinds = std.ArrayList(ObjectKind).init(alloc),
+        };
     }
 
-    /// called by VM.release, do not call manually
-    fn _release(box: *Box, vm: *VM) void {
-        switch (box.data) {
+    fn deinit(rt: *RT) void {
+        rt.metadata.deinit();
+        rt.objects.deinit();
+        rt.hashes.deinit();
+        rt.kinds.deinit();
+    }
+
+    fn metadataPtr(rt: *RT, ref: u32) *Meta {
+        std.debug.assert(ref < rt.metadata.items.len);
+        return &rt.metadata.items[ref];
+    }
+
+    fn objectPtr(rt: *RT, ref: u32) *Object {
+        std.debug.assert(ref < rt.objects.items.len);
+        return &rt.objects.items[ref];
+    }
+
+    fn hashPtr(rt: *RT, ref: u32) *Hash {
+        std.debug.assert(ref < rt.hashes.items.len);
+        return &rt.hashes.items[ref];
+    }
+
+    fn kindPtr(rt: *RT, ref: u32) *ObjectKind {
+        std.debug.assert(ref < rt.kinds.items.len);
+        return &rt.kinds.items[ref];
+    }
+
+    /// add a reference to an existing object
+    fn obtain(rt: *RT, ref: Ref) void {
+        if (ref == nil) return;
+        const meta = rt.metadataPtr(ref);
+        meta.rc += 1;
+    }
+
+    /// remove a reference from an existing obj, putting it on the free list if it has no parents
+    fn release(rt: *RT, ref: Ref) void {
+        const meta = rt.metadataPtr(ref);
+        meta.rc -= 1;
+        if (meta.rc == 0) {
+            meta.next = rt.free_list;
+            rt.free_list = ref;
+        }
+    }
+
+    fn newReal(rt: *RT, value: f64) Ref {
+        const ref = rt._new();
+        const obj = rt.objectPtr(ref);
+        obj.* = Object{ .real = value };
+        rt.kindPtr(ref).* = .real;
+        rt._hash(ref);
+        return ref;
+    }
+
+    fn newCons(rt: *RT, car: Ref, cdr: Ref) Ref {
+        const ref = rt._new();
+        const obj = rt.objectPtr(ref);
+        rt.obtain(car);
+        rt.obtain(cdr);
+        obj.* = Object{ .cons = .{ .car = car, .cdr = cdr } };
+        rt.kindPtr(ref).* = .cons;
+        rt._hash(ref);
+        return ref;
+    }
+
+    /// actually release a value in the free_list so that the memory can be reused
+    /// called on value in free list when we try to allocate (i.e. lazy refcounting)
+    fn _releaseImpl(rt: *RT, ref: Ref) void {
+        switch (rt.kindPtr(ref).*) {
             .real => {},
-            .cons => |cons| {
-                std.debug.print("{} {}\n", .{ cons.car, cons.cdr });
-                if (cons.car != nil) vm.release(cons.car);
-                if (cons.cdr != nil) vm.release(cons.cdr);
+            .cons => {
+                const cons = rt.objectPtr(ref).cons;
+                if (cons.car != nil) rt.release(cons.car);
+                if (cons.cdr != nil) rt.release(cons.cdr);
             },
-            .hamt => |hamt| {
+            .hamt => {
+                const hamt = rt.objectPtr(ref).hamt;
                 for (hamt.children) |child| {
-                    if (child != nil) vm.release(child);
+                    if (child != nil) rt.release(child);
                 }
             },
         }
     }
 
-    fn _hash(box: *Box, vm: *VM) void {
-        box.hash = switch (box.data) {
-            .real => std.hash.XxHash32.hash(1337, std.mem.asBytes(&box.data.real)),
-            .cons => |cons| blk: {
+    fn _new(rt: *RT) Ref {
+        if (rt.free_list == nil) {
+            std.debug.assert(rt.metadata.items.len == rt.objects.items.len);
+            std.debug.assert(rt.metadata.items.len == rt.hashes.items.len);
+            std.debug.assert(rt.metadata.items.len == rt.kinds.items.len);
+            const ref: Ref = @intCast(rt.objects.items.len);
+            rt.metadata.append(.{ .rc = 1 }) catch @panic("out of memory");
+            rt.objects.append(.{ .hamt = undefined }) catch @panic("out of memory");
+            rt.hashes.append(undefined) catch @panic("out of memory");
+            rt.kinds.append(undefined) catch @panic("out of memory");
+            return ref;
+        }
+
+        const ref = rt.free_list;
+        rt.free_list = rt.metadataPtr(ref).next;
+        rt._releaseImpl(ref); // lazy refcounting
+        rt.metadataPtr(ref).rc = 1;
+        return ref;
+    }
+
+    fn _hash(rt: *RT, ref: Ref) void {
+        rt.hashPtr(ref).* = switch (rt.kindPtr(ref).*) {
+            .real => std.hash.XxHash32.hash(1337, std.mem.asBytes(&rt.objectPtr(ref).real)),
+            .cons => blk: {
+                const cons = rt.objectPtr(ref).cons;
                 var h: u32 = 0;
-                h ^= if (cons.car == nil) NILHASH else vm.boxPtr(cons.car).hash;
+                h ^= if (cons.car == nil) NILHASH else rt.hashPtr(cons.car).*;
                 h *%= 91;
-                h ^= if (cons.cdr == nil) NILHASH else vm.boxPtr(cons.cdr).hash;
+                h ^= if (cons.cdr == nil) NILHASH else rt.hashPtr(cons.cdr).*;
                 break :blk h;
             },
-            .hamt => |hamt| blk: {
+            .hamt => blk: {
+                const hamt = rt.objectPtr(ref).hamt;
                 var h: u32 = 0;
                 for (hamt.children) |child| {
-                    h ^= if (child == nil) NILHASH else vm.boxPtr(child).hash;
+                    h ^= if (child == nil) NILHASH else rt.hashPtr(child).*;
                     h *%= 89;
                 }
                 break :blk h;
@@ -111,180 +178,53 @@ const Box = struct {
         };
     }
 
-    fn _debugPrint(box: *Box, vm: *VM) void {
-        switch (box.data) {
-            .real => std.debug.print("{}", .{box.data.real}),
-            .cons => |cons| {
+    fn debugPrint(rt: *RT, ref: Ref) void {
+        if (ref == nil) std.debug.print("nil", .{});
+        rt._debugPrintImpl(ref);
+        std.debug.print("\n", .{});
+    }
+
+    fn _debugPrintImpl(rt: *RT, ref: Ref) void {
+        switch (rt.kindPtr(ref).*) {
+            .real => std.debug.print("{}", .{rt.objectPtr(ref).real}),
+            .cons => {
+                const cons = rt.objectPtr(ref).cons;
                 // TODO special case for list printing?
                 std.debug.print("(", .{});
                 if (cons.car == nil)
                     std.debug.print("nil", .{})
                 else
-                    vm.boxPtr(cons.car)._debugPrint(vm);
+                    rt._debugPrintImpl(cons.car);
                 std.debug.print(" . ", .{});
                 if (cons.cdr == nil)
                     std.debug.print("nil", .{})
                 else
-                    vm.boxPtr(cons.cdr)._debugPrint(vm);
+                    rt._debugPrintImpl(cons.cdr);
                 std.debug.print(")", .{});
             },
             .hamt => {
                 std.debug.print("{{", .{});
-                box._debugPrintHamtImpl(vm);
+                // box._debugPrintHamtImpl(vm);
                 std.debug.print("}}", .{});
             },
         }
     }
-
-    fn _debugPrintHamtImpl(box: *Box, vm: *VM) void {
-        std.debug.assert(box.data == .hamt);
-        const hamt = box.data.hamt;
-
-        for (hamt.children) |child| {
-            if (child == nil) continue;
-            const x = vm.boxPtr(child);
-            switch (x.data) {
-                .cons => |cons| {
-                    // NOTE hashmaps can overflow
-                    if (cons.car == nil)
-                        std.debug.print("nil", .{})
-                    else
-                        vm.boxPtr(cons.car)._debugPrint(vm);
-                    std.debug.print(" ", .{});
-                    if (cons.cdr == nil)
-                        std.debug.print("nil", .{})
-                    else
-                        vm.boxPtr(cons.cdr)._debugPrint(vm);
-                },
-                .hamt => {
-                    x._debugPrintHamtImpl(vm);
-                },
-                else => unreachable,
-            }
-            std.debug.print(" ", .{});
-        }
-    }
-};
-
-const VM = struct {
-    boxes: std.ArrayList(Box),
-    free_list: u32 = nil,
-
-    fn init(alloc: std.mem.Allocator) VM {
-        return .{
-            .boxes = std.ArrayList(Box).init(alloc),
-        };
-    }
-
-    fn deinit(vm: *VM) void {
-        vm.boxes.deinit();
-    }
-
-    fn new(vm: *VM) u32 {
-        if (vm.free_list == nil) {
-            const ref: u32 = @intCast(vm.boxes.items.len);
-            vm.boxes.append(.{
-                .meta = 1,
-                .hash = undefined,
-                .data = undefined,
-            }) catch @panic("out of memory");
-            return ref;
-        }
-
-        const ref = vm.free_list;
-        const box = vm.boxPtr(ref);
-        box._release(vm); // lazy refcounting
-        box.meta = 1;
-        return ref;
-    }
-
-    fn newReal(vm: *VM, value: f64) u32 {
-        const ref = vm.new();
-        const box = vm.boxPtr(ref);
-        box.data = Data{ .real = value };
-        box._hash(vm);
-        return ref;
-    }
-
-    fn newCons(vm: *VM, car: u32, cdr: u32) u32 {
-        const ref = vm.new();
-        const box = vm.boxPtr(ref);
-        vm.obtain(car);
-        vm.obtain(cdr);
-        box.data = Data{ .cons = .{ .car = car, .cdr = cdr } };
-        box._hash(vm);
-        return ref;
-    }
-
-    fn newHamt(vm: *VM, c0: u32, c1: u32, c2: u32, c3: u32) u32 {
-        const ref = vm.new();
-        const box = vm.boxPtr(ref);
-        vm.obtain(c0);
-        vm.obtain(c1);
-        vm.obtain(c2);
-        vm.obtain(c3);
-        box.data = Data{ .hamt = .{
-            .children = .{ c0, c1, c2, c3 },
-            .leaf = true,
-        } };
-        box._hash(vm);
-        return ref;
-    }
-
-    fn copyNoObtain(vm: *VM, box: *Box) u32 {
-        const ref = vm.new();
-        const copy = vm.boxPtr(ref);
-        copy.* = box.*;
-        copy.meta = 1;
-        return ref;
-    }
-
-    /// add a reference to an existing box
-    fn obtain(vm: *VM, ref: u32) void {
-        if (ref == nil) return;
-        const box = vm.boxPtr(ref);
-        box.meta += 1;
-    }
-
-    /// remove a reference from an existing box
-    fn release(vm: *VM, ref: u32) void {
-        const box = vm.boxPtr(ref);
-        box.meta -= 1;
-        if (box.meta == 0) {
-            box.meta = vm.free_list;
-            vm.free_list = ref;
-        }
-    }
-
-    fn boxPtr(vm: *VM, ref: u32) *Box {
-        std.debug.assert(ref < vm.boxes.items.len);
-        return &vm.boxes.items[ref];
-    }
-
-    fn debugPrint(vm: *VM, ref: u32) void {
-        if (ref == nil) std.debug.print("nil", .{});
-        vm.boxPtr(ref)._debugPrint(vm);
-        std.debug.print("\n", .{});
-    }
 };
 
 pub fn main() !void {
-    std.debug.print("{} {}\n", .{ @sizeOf(Data), @alignOf(Data) });
-    std.debug.print("{} {}\n", .{ @sizeOf(Box), @alignOf(Box) });
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
 
-    var vm = VM.init(alloc);
-    defer vm.deinit();
+    var rt = RT.init(alloc);
+    defer rt.deinit();
 
-    const a = vm.newReal(1.0);
-    const b = vm.newReal(2.0);
+    const a = rt.newReal(1.0);
+    const b = rt.newReal(2.0);
+    const c = rt.newCons(a, b);
 
-    const m = vm.newHamt(nil, vm.newCons(a, b), nil, nil);
-    vm.debugPrint(m);
+    rt.debugPrint(c);
 
-    const m2 = vm.boxPtr(m).assoc(b, a, &vm);
-    vm.debugPrint(m);
-    vm.debugPrint(m2);
+    rt.release(a);
+    rt.release(c);
+    rt.release(b);
 }
