@@ -183,19 +183,31 @@ const RT = struct {
             if (child == nil) {
                 walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
             } else {
-                // FIXME TODO special case where key is aready present
-                // make a new subtree and insert
-                // - the thing we collided with
-                // - the new kv pair
-                std.debug.assert(rt.kindPtr(child).* == .cons);
-                const childptr = rt.objectPtr(child);
-                // using immutable modifications here is pretty inefficient though...
-                const h0 = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
-                const h1 = rt._hamtAssocImpl(h0, childptr.cons.car, childptr.cons.cdr, depth + 1);
-                const h2 = rt._hamtAssocImpl(h1, keyref, valref, depth + 1);
-                rt.release(h0);
-                rt.release(h1);
-                walk_ptr.hamt.children[i] = h2;
+                switch (rt.kindPtr(child).*) {
+                    .cons => {
+                        const cons = rt.objectPtr(child).cons;
+                        if (rt.eql(cons.car, keyref)) {
+                            // special case where key is aready present
+                            walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
+                        } else {
+                            // make a new subtree and insert
+                            // - the thing we collided with
+                            // - the new kv pair
+                            // using immutable modifications here is pretty inefficient though...
+                            const h0 = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
+                            const h1 = rt._hamtAssocImpl(h0, cons.car, cons.cdr, depth + 1);
+                            const h2 = rt._hamtAssocImpl(h1, keyref, valref, depth + 1);
+                            rt.release(h0);
+                            rt.release(h1);
+                            walk_ptr.hamt.children[i] = h2;
+                        }
+                    },
+                    .hamt => {
+                        walk_ptr.hamt.children[i] =
+                            rt._hamtAssocImpl(child, keyref, valref, depth + 1);
+                    },
+                    else => unreachable,
+                }
             }
         }
 
