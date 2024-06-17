@@ -253,10 +253,57 @@ const RT = struct {
     }
 
     fn hamtDissoc(rt: *RT, ref: Ref, keyref: Ref) Ref {
-        _ = rt;
-        _ = ref;
-        _ = keyref;
-        return nil;
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        const result = rt._hamtDissocImpl(ref, keyref, 0);
+        if (result == ref) rt.obtain(result); // key not found, return the same map so increase rc
+        return result;
+    }
+
+    fn _hamtDissocImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) Ref {
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        if (depth > 9) @panic("max depth");
+
+        const hamt = rt.objectPtr(ref).hamt;
+        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
+        const child = hamt.children[i];
+        if (child == nil) return ref;
+        switch (rt.kindPtr(child).*) {
+            .cons => {
+                const cons = rt.objectPtr(child).cons;
+                if (!rt.eql(cons.car, keyref)) return ref;
+
+                // for simplicity, only delete hamt nodes when completely empty
+                // even though we could lower the tree height by removing if there is 1 child
+                var n: u32 = 0;
+                for (hamt.children) |c| {
+                    if (c != nil) n += 1;
+                }
+                std.debug.assert(n > 0);
+                if (n == 1) return nil;
+
+                // just delete a node
+                const walk = rt._dupNoObtain(ref);
+                const walk_ptr = rt.objectPtr(walk);
+                walk_ptr.hamt.children[i] = nil;
+                for (0..8) |j| rt.obtain(walk_ptr.hamt.children[j]);
+                rt._hash(walk);
+                return walk;
+            },
+            .hamt => {
+                const result = rt._hamtDissocImpl(child, keyref, depth + 1);
+                if (result == child) return ref;
+                const walk = rt._dupNoObtain(ref);
+                const walk_ptr = rt.objectPtr(walk);
+                walk_ptr.hamt.children[i] = result;
+                for (0..8) |j| {
+                    if (i == j) continue;
+                    rt.obtain(walk_ptr.hamt.children[j]);
+                }
+                rt._hash(walk);
+                return walk;
+            },
+            else => unreachable,
+        }
     }
 
     fn debugPrint(rt: *RT, ref: Ref) void {
@@ -413,6 +460,9 @@ pub fn main() !void {
     const e = rt.hamtAssoc(d, a, b);
     const f = rt.hamtAssoc(e, b, c);
     const g = rt.hamtAssoc(f, c, a);
+    const h = rt.hamtDissoc(g, a);
+    const i = rt.hamtDissoc(h, b);
+    const j = rt.hamtDissoc(i, c);
 
     rt.debugPrint(a);
     rt.debugPrint(b);
@@ -421,6 +471,9 @@ pub fn main() !void {
     rt.debugPrint(e);
     rt.debugPrint(f);
     rt.debugPrint(g);
+    rt.debugPrint(h);
+    rt.debugPrint(i);
+    rt.debugPrint(j);
 
     std.debug.print("{}\n", .{rt.hamtContains(g, a)});
     std.debug.print("{}\n", .{rt.hamtContains(g, b)});
@@ -439,11 +492,11 @@ pub fn main() !void {
     rt.debugPrint(rt.hamtGet(g, g));
 
     std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, i| {
+    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
         switch (kind) {
-            .real => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.real }),
-            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.cons }),
-            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.hamt }),
+            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
+            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
+            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
         }
     }
 
@@ -453,11 +506,11 @@ pub fn main() !void {
     _ = rt.newReal(0.0);
 
     std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, i| {
+    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
         switch (kind) {
-            .real => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.real }),
-            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.cons }),
-            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.hamt }),
+            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
+            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
+            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
         }
     }
 
@@ -468,4 +521,21 @@ pub fn main() !void {
     rt.release(e);
     rt.release(f);
     rt.release(g);
+    rt.release(h);
+    rt.release(i);
+    rt.release(j);
+
+    while (rt.free_list != nil) {
+        _ = rt.newReal(0.0);
+    }
+    _ = rt.newReal(0.0);
+
+    std.debug.print("--- object breakdown ---\n", .{});
+    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
+        switch (kind) {
+            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
+            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
+            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
+        }
+    }
 }
