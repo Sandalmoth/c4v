@@ -132,6 +132,31 @@ const RT = struct {
         return ref;
     }
 
+    /// checks if two objects are identical by value
+    fn eql(rt: *RT, aref: Ref, bref: Ref) bool {
+        // is it better to test hash first or kind first?
+        // intuition says hash, since there are more options so false equality should be more rare
+        if (aref == bref) return true;
+        if (rt.hashPtr(aref).* != rt.hashPtr(bref).*) return false;
+        if (rt.kindPtr(aref).* != rt.kindPtr(bref).*) return false;
+
+        std.debug.assert(rt.kindPtr(aref).* == rt.kindPtr(bref).*);
+        return switch (rt.kindPtr(aref).*) {
+            .real => rt.objectPtr(aref).real == rt.objectPtr(bref).real,
+            .cons => blk: {
+                const a = rt.objectPtr(aref).cons;
+                const b = rt.objectPtr(bref).cons;
+                break :blk rt.eql(a.car, b.car) and rt.eql(a.cdr, b.cdr);
+            },
+            .hamt => blk: {
+                const a = rt.objectPtr(aref).hamt;
+                const b = rt.objectPtr(bref).hamt;
+                for (0..8) |i| if (!rt.eql(a.children[i], b.children[i])) break :blk false;
+                break :blk true;
+            },
+        };
+    }
+
     fn hamtAssoc(rt: *RT, ref: Ref, keyref: Ref, valref: Ref) Ref {
         std.debug.assert(rt.kindPtr(ref).* == .hamt);
         return rt._hamtAssocImpl(ref, keyref, valref, 0);
@@ -139,7 +164,6 @@ const RT = struct {
 
     fn _hamtAssocImpl(rt: *RT, ref: Ref, keyref: Ref, valref: Ref, depth: u32) Ref {
         std.debug.assert(rt.kindPtr(ref).* == .hamt);
-
         if (depth > 9) @panic("max depth");
 
         const walk = rt._dupNoObtain(ref);
@@ -159,6 +183,7 @@ const RT = struct {
             if (child == nil) {
                 walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
             } else {
+                // FIXME TODO special case where key is aready present
                 // make a new subtree and insert
                 // - the thing we collided with
                 // - the new kv pair
@@ -176,6 +201,62 @@ const RT = struct {
 
         rt._hash(walk);
         return walk;
+    }
+
+    fn hamtContains(rt: *RT, ref: Ref, keyref: Ref) bool {
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        return rt._hamtContainsImpl(ref, keyref, 0);
+    }
+
+    fn _hamtContainsImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) bool {
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        if (depth > 9) @panic("max depth");
+
+        const hamt = rt.objectPtr(ref).hamt;
+        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
+        const child = hamt.children[i];
+        if (child == nil) return false;
+        return switch (rt.kindPtr(child).*) {
+            .cons => blk: {
+                const cons = rt.objectPtr(child).cons;
+                break :blk rt.eql(cons.car, keyref);
+            },
+            .hamt => _hamtContainsImpl(rt, child, keyref, depth + 1),
+            else => unreachable,
+        };
+    }
+
+    fn hamtGet(rt: *RT, ref: Ref, keyref: Ref) Ref {
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        return rt._hamtGetImpl(ref, keyref, 0);
+    }
+
+    fn _hamtGetImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) Ref {
+        std.debug.assert(rt.kindPtr(ref).* == .hamt);
+        if (depth > 9) @panic("max depth");
+
+        const hamt = rt.objectPtr(ref).hamt;
+        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
+        const child = hamt.children[i];
+        if (child == nil) return nil;
+        return switch (rt.kindPtr(child).*) {
+            .cons => blk: {
+                const cons = rt.objectPtr(child).cons;
+                break :blk if (rt.eql(cons.car, keyref))
+                    cons.cdr
+                else
+                    nil;
+            },
+            .hamt => _hamtGetImpl(rt, child, keyref, depth + 1),
+            else => unreachable,
+        };
+    }
+
+    fn hamtDissoc(rt: *RT, ref: Ref, keyref: Ref) Ref {
+        _ = rt;
+        _ = ref;
+        _ = keyref;
+        return nil;
     }
 
     fn debugPrint(rt: *RT, ref: Ref) void {
@@ -341,12 +422,42 @@ pub fn main() !void {
     rt.debugPrint(f);
     rt.debugPrint(g);
 
+    std.debug.print("{}\n", .{rt.hamtContains(g, a)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, b)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, c)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, d)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, e)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, f)});
+    std.debug.print("{}\n", .{rt.hamtContains(g, g)});
+
+    rt.debugPrint(rt.hamtGet(g, a));
+    rt.debugPrint(rt.hamtGet(g, b));
+    rt.debugPrint(rt.hamtGet(g, c));
+    rt.debugPrint(rt.hamtGet(g, d));
+    rt.debugPrint(rt.hamtGet(g, e));
+    rt.debugPrint(rt.hamtGet(g, f));
+    rt.debugPrint(rt.hamtGet(g, g));
+
     std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, 0..) |obj, kind, i| {
+    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, i| {
         switch (kind) {
-            .real => std.debug.print("{:>3} {}\n", .{ i, obj.real }),
-            .cons => std.debug.print("{:>3} {}\n", .{ i, obj.cons }),
-            .hamt => std.debug.print("{:>3} {}\n", .{ i, obj.hamt }),
+            .real => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.real }),
+            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.cons }),
+            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.hamt }),
+        }
+    }
+
+    while (rt.free_list != nil) {
+        _ = rt.newReal(0.0);
+    }
+    _ = rt.newReal(0.0);
+
+    std.debug.print("--- object breakdown ---\n", .{});
+    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, i| {
+        switch (kind) {
+            .real => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.real }),
+            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.cons }),
+            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ i, meta.rc, obj.hamt }),
         }
     }
 
