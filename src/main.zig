@@ -475,6 +475,7 @@ pub fn main() !void {
     const h = rt.hamtDissoc(g, a);
     const i = rt.hamtDissoc(h, b);
     const j = rt.hamtDissoc(i, c);
+    const k = rt.hamtAssoc(g, c, b);
 
     rt.debugPrint(a);
     rt.debugPrint(b);
@@ -486,6 +487,7 @@ pub fn main() !void {
     rt.debugPrint(h);
     rt.debugPrint(i);
     rt.debugPrint(j);
+    rt.debugPrint(k);
 
     std.debug.print("{}\n", .{rt.hamtContains(g, a)});
     std.debug.print("{}\n", .{rt.hamtContains(g, b)});
@@ -536,6 +538,7 @@ pub fn main() !void {
     rt.release(h);
     rt.release(i);
     rt.release(j);
+    rt.release(k);
 
     while (rt.free_list != nil) {
         _ = rt.newReal(0.0);
