@@ -464,6 +464,7 @@ const RT = struct {
 pub fn main() !void {
     try scratch();
     try benchmark();
+    try benchmarkReference();
     try fuzz();
 }
 
@@ -511,6 +512,41 @@ fn fuzz() !void {
         }
 
         rt.release(h);
+    }
+}
+
+fn benchmarkReference() !void {
+    // obviously, this isn't persistent so not a perfect comparison
+    // I just want some idea of how a normal hashmap performs
+    // (looks like we're about 5-10x slower with the hamt)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+    var timer = try std.time.Timer.start();
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const m = 30000;
+    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
+
+    for (ns) |n| {
+        timer.reset();
+        var s = std.AutoHashMap(u64, u64).init(alloc);
+        defer s.deinit();
+        var n_assoc: u32 = 0;
+        var n_dissoc: u32 = 0;
+        for (0..m) |_| {
+            const a = rand.intRangeLessThan(u64, 0, n);
+            const b = rand.intRangeLessThan(u64, 0, n);
+
+            if (s.contains(a)) {
+                _ = s.remove(a);
+                n_dissoc += 1;
+            } else {
+                try s.put(a, b);
+                n_assoc += 1;
+            }
+        }
+        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
     }
 }
 
