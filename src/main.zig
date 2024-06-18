@@ -193,11 +193,11 @@ const RT = struct {
                             // make a new subtree and insert
                             // - the thing we collided with
                             // - the new kv pair
-                            // using immutable modifications here is pretty inefficient though...
-                            const h0 = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
-                            const h1 = rt._hamtAssocImpl(h0, cons.car, cons.cdr, depth + 1);
+                            const k = (rt.hashPtr(cons.car).* >> @intCast((depth + 1) * 3)) & 7;
+                            var contents = [_]u32{ nil, nil, nil, nil, nil, nil, nil, nil };
+                            contents[k] = child;
+                            const h1 = rt.newHamt(contents);
                             const h2 = rt._hamtAssocImpl(h1, keyref, valref, depth + 1);
-                            rt.release(h0);
                             rt.release(h1);
                             walk_ptr.hamt.children[i] = h2;
                         }
@@ -524,7 +524,7 @@ fn benchmarkReference() !void {
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
     var timer = try std.time.Timer.start();
-    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const ns = [_]u32{ 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const m = 30000;
     std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
 
