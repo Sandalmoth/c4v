@@ -45,10 +45,10 @@ const RT = struct {
 
     fn init(alloc: std.mem.Allocator) RT {
         return .{
-            .metadata = std.ArrayList(Meta).init(alloc),
-            .objects = std.ArrayList(Object).init(alloc),
-            .hashes = std.ArrayList(Hash).init(alloc),
-            .kinds = std.ArrayList(ObjectKind).init(alloc),
+            .metadata = std.ArrayList(Meta).initCapacity(alloc, 65536) catch @panic("oom"),
+            .objects = std.ArrayList(Object).initCapacity(alloc, 65536) catch @panic("oom"),
+            .hashes = std.ArrayList(Hash).initCapacity(alloc, 65536) catch @panic("oom"),
+            .kinds = std.ArrayList(ObjectKind).initCapacity(alloc, 65536) catch @panic("oom"),
         };
     }
 
@@ -459,6 +459,51 @@ const RT = struct {
 };
 
 pub fn main() !void {
+    try scratch();
+    try benchmark();
+}
+
+fn benchmark() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+    var timer = try std.time.Timer.start();
+
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const m = 10000;
+
+    for (ns) |n| {
+        var rt = RT.init(alloc);
+        defer rt.deinit();
+
+        timer.reset();
+        var h = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
+
+        for (0..m) |_| {
+            const a = rt.newReal(@floatFromInt(rand.intRangeLessThan(u32, 0, n)));
+            const b = rt.newReal(@floatFromInt(rand.intRangeLessThan(u32, 0, n)));
+
+            if (rt.hamtContains(h, a)) {
+                const h2 = rt.hamtDissoc(h, a);
+                rt.release(h);
+                h = h2;
+            } else {
+                const h2 = rt.hamtAssoc(h, a, b);
+                rt.release(h);
+                h = h2;
+            }
+
+            rt.release(a);
+            rt.release(b);
+        }
+
+        rt.release(h);
+        std.debug.print("{}\t{}\n", .{ n, timer.read() / m });
+    }
+}
+
+fn scratch() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
 
