@@ -286,12 +286,15 @@ const RT = struct {
 
                 // for simplicity, only delete hamt nodes when completely empty
                 // even though we could lower the tree height by removing if there is 1 child
-                var n: u32 = 0;
-                for (hamt.children) |c| {
-                    if (c != nil) n += 1;
+                // though never do this at root level, we don't want to remove the whole map
+                if (depth > 0) {
+                    var n: u32 = 0;
+                    for (hamt.children) |c| {
+                        if (c != nil) n += 1;
+                    }
+                    std.debug.assert(n > 0);
+                    if (n == 1) return nil;
                 }
-                std.debug.assert(n > 0);
-                if (n == 1) return nil;
 
                 // just delete a node
                 const walk = rt._dupNoObtain(ref);
@@ -461,6 +464,54 @@ const RT = struct {
 pub fn main() !void {
     try scratch();
     try benchmark();
+    try fuzz();
+}
+
+fn fuzz() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const m = 30000;
+
+    for (ns) |n| {
+        var rt = RT.init(alloc);
+        defer rt.deinit();
+
+        var h = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
+        var s = std.AutoHashMap(u32, u32).init(alloc);
+        defer s.deinit();
+
+        for (0..m) |_| {
+            const x = rand.intRangeLessThan(u32, 0, n);
+            const y = rand.intRangeLessThan(u32, 0, n);
+            const a = rt.newReal(@floatFromInt(x));
+            const b = rt.newReal(@floatFromInt(y));
+
+            std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
+            if (rt.hamtContains(h, a)) {
+                std.debug.assert(
+                    @as(u32, @intFromFloat(rt.objectPtr(rt.hamtGet(h, a)).real)) == s.get(x).?,
+                );
+                const h2 = rt.hamtDissoc(h, a);
+                rt.release(h);
+                h = h2;
+                _ = s.remove(x);
+            } else {
+                const h2 = rt.hamtAssoc(h, a, b);
+                rt.release(h);
+                h = h2;
+                try s.put(x, y);
+            }
+
+            rt.release(a);
+            rt.release(b);
+        }
+
+        rt.release(h);
+    }
 }
 
 fn benchmark() !void {
