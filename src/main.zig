@@ -471,7 +471,8 @@ fn benchmark() !void {
     var timer = try std.time.Timer.start();
 
     const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
-    const m = 10000;
+    const m = 30000;
+    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
 
     for (ns) |n| {
         var rt = RT.init(alloc);
@@ -479,6 +480,9 @@ fn benchmark() !void {
 
         timer.reset();
         var h = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
+
+        var n_assoc: u32 = 0;
+        var n_dissoc: u32 = 0;
 
         for (0..m) |_| {
             const a = rt.newReal(@floatFromInt(rand.intRangeLessThan(u32, 0, n)));
@@ -488,10 +492,12 @@ fn benchmark() !void {
                 const h2 = rt.hamtDissoc(h, a);
                 rt.release(h);
                 h = h2;
+                n_dissoc += 1;
             } else {
                 const h2 = rt.hamtAssoc(h, a, b);
                 rt.release(h);
                 h = h2;
+                n_assoc += 1;
             }
 
             rt.release(a);
@@ -499,7 +505,7 @@ fn benchmark() !void {
         }
 
         rt.release(h);
-        std.debug.print("{}\t{}\n", .{ n, timer.read() / m });
+        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
     }
 }
 
