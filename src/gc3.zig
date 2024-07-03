@@ -1,8 +1,16 @@
 const std = @import("std");
 
-const Kind = enum {
+const Kind = enum(u8) {
     real,
+    cons,
 };
+
+fn KindType(comptime kind: Kind) type {
+    return switch (kind) {
+        .real => f64,
+        .cons => [2]Ref,
+    };
+}
 
 const Ref = extern struct {
     page: u32 align(8),
@@ -58,6 +66,7 @@ fn SingularGCType(comptime kind: Kind, comptime T: type) type {
                 .page_marks = std.ArrayList(bool).init(alloc),
                 .reusable = std.ArrayList(u32).init(alloc),
             };
+            // NOTE we have to alloc in the big gc alloc, so avoiding allocs here is not needed
         }
 
         fn deinit(sgc: *SGC) void {
@@ -134,10 +143,17 @@ fn SingularGCType(comptime kind: Kind, comptime T: type) type {
             return page.data[ref.slot];
         }
 
-        fn trace(sgc: *SGC, ref: Ref) void {
+        fn trace(sgc: *SGC, ref: Ref, gc: *GC) void {
             sgc.page_table.items[ref.page].?.marks.set(ref.slot);
             sgc.page_marks.items[ref.page] = true;
-            traceAny(@ptrCast(sgc), ref, kind);
+            switch (kind) {
+                .real => {},
+                .cons => {
+                    const cons = sgc.get(ref);
+                    gc.trace(cons[0]);
+                    gc.trace(cons[1]);
+                },
+            }
         }
 
         fn sweep(sgc: *SGC) void {
@@ -233,7 +249,7 @@ fn SingularGCType(comptime kind: Kind, comptime T: type) type {
                     const j = (k + offset) % list2.items.len;
                     if (!canMerge(list1.items[i], list2.items[j])) continue;
 
-                    std.debug.print("merging {} {}\n", .{ list1.items[i].len, list2.items[j].len });
+                    std.debug.print("merge {} {}\n", .{ list1.items[i].len, list2.items[j].len });
                     mergeInto(list1.items[i], list2.items[j]);
                     // redirect all entries pointing to the page we just merged
                     for (sgc.page_table.items) |*pt| {
@@ -259,43 +275,158 @@ fn SingularGCType(comptime kind: Kind, comptime T: type) type {
 }
 
 // probably rewrite s.t. it takes the general gc instead?
-fn traceAny(sgc: *anyopaque, ref: Ref, comptime kind: Kind) void {
-    _ = sgc;
-    _ = ref;
-    switch (kind) {
-        .real => {},
-    }
-}
+// fn traceAny(gc: *GC, ref: Ref, comptime kind: Kind) void {
+//     switch (kind) {
+//         .real => {},
+//         .cons => |cons| {
+//             const cons =
+//                 gc.trace(cons[0]);
+//             gc.trace(cons[1]);
+//         },
+//     }
+// }
 
-fn finalizeAny(sgc: *anyopaque, ref: Ref, comptime kind: Kind) void {
-    _ = sgc;
-    _ = ref;
-    switch (kind) {
-        .real => {},
-    }
-}
+// fn finalizeAny(sgc: *anyopaque, ref: Ref, comptime kind: Kind) void {
+//     _ = sgc;
+//     _ = ref;
+//     switch (kind) {
+//         .real => {},
+//         .cons => {},
+//     }
+// }
 
-test "sgc scratch" {
+// test "sgc scratch" {
+//     var rng = std.Random.DefaultPrng.init(
+//         @bitCast(std.time.microTimestamp() *% 7951182790392048631),
+//     );
+//     const rand = rng.random();
+
+//     const SGC = SingularGCType(.real, f64);
+//     var sgc = SGC.init(std.testing.allocator, rand);
+//     defer sgc.deinit();
+
+//     var a = std.ArrayList(Ref).init(std.testing.allocator);
+//     defer a.deinit();
+
+//     var w: f64 = 0.0;
+//     for (0..1000) |_| {
+//         while (a.items.len < 1024) {
+//             const x = try sgc.create(w);
+//             w += 1.0;
+//             const e = sgc.get(x);
+//             _ = e;
+//             try a.append(x);
+//         }
+
+//         while (a.items.len > 512) {
+//             const i = rand.uintLessThan(usize, a.items.len);
+//             _ = a.swapRemove(i);
+//         }
+//         for (a.items) |x| {
+//             sgc.trace(x, @ptrFromInt(8)); // dummy, never dereferenced in this test
+//         }
+
+//         sgc.sweep();
+//         sgc.compact();
+//         std.debug.print(
+//             "current page count {}\tcurrent table size {}\n",
+//             .{ sgc.inactive_pages.items.len + 1, sgc.page_counter - sgc.reusable.items.len },
+//         );
+//     }
+// }
+
+const GC = struct {
+    const n_kinds = std.meta.fields(Kind).len;
+
+    alloc: std.mem.Allocator,
+    sgcs: [n_kinds]*anyopaque,
+
+    fn init(alloc: std.mem.Allocator, rand: std.Random.Random) !GC {
+        var gc = GC{
+            .alloc = alloc,
+            .sgcs = undefined,
+        };
+        // these loops are a bit inelegant
+        // could we iterate over the enum directly?
+        // iterating over std.meta.fields(Kind) doesn't seem to work
+        inline for (0..n_kinds) |i| {
+            const kind: Kind = @enumFromInt(i);
+            const SGC = SingularGCType(kind, KindType(kind));
+            const sgc = try alloc.create(SGC);
+            sgc.* = SingularGCType(kind, KindType(kind)).init(alloc, rand);
+            gc.sgcs[i] = sgc;
+        }
+        return gc;
+    }
+
+    fn deinit(gc: *GC) void {
+        inline for (0..n_kinds) |i| {
+            const kind: Kind = @enumFromInt(i);
+            const sgc = gc.gets(kind);
+            sgc.deinit();
+            gc.alloc.destroy(sgc);
+        }
+        gc.* = undefined;
+    }
+
+    fn gets(gc: *GC, comptime kind: Kind) *SingularGCType(kind, KindType(kind)) {
+        return @alignCast(@ptrCast(gc.sgcs[@intFromEnum(kind)]));
+    }
+
+    fn create(gc: *GC, comptime kind: Kind, val: KindType(kind)) !Ref {
+        return gc.gets(kind).create(val);
+    }
+
+    fn trace(gc: *GC, ref: Ref) void {
+        switch (ref.kind) {
+            .real => {
+                gc.gets(.real).trace(ref, gc);
+            },
+            .cons => {
+                gc.gets(.cons).trace(ref, gc);
+            },
+        }
+    }
+
+    fn sweep(gc: *GC) void {
+        inline for (0..n_kinds) |i| {
+            gc.gets(@enumFromInt(i)).sweep();
+        }
+    }
+
+    fn compact(gc: *GC) void {
+        inline for (0..n_kinds) |i| {
+            gc.gets(@enumFromInt(i)).compact();
+        }
+    }
+};
+
+test "gc scratch" {
     var rng = std.Random.DefaultPrng.init(
         @bitCast(std.time.microTimestamp() *% 7951182790392048631),
     );
     const rand = rng.random();
 
-    const SGC = SingularGCType(.real, f64);
-    var sgc = SGC.init(std.testing.allocator, rand);
-    defer sgc.deinit();
+    var gc = try GC.init(std.testing.allocator, rand);
+    defer gc.deinit();
 
     var a = std.ArrayList(Ref).init(std.testing.allocator);
     defer a.deinit();
 
     var w: f64 = 0.0;
-    for (0..1000) |_| {
+    for (0..100) |_| {
         while (a.items.len < 1024) {
-            const x = try sgc.create(w);
-            w += 1.0;
-            const e = sgc.get(x);
-            _ = e;
-            try a.append(x);
+            if (a.items.len < 2 or rand.boolean()) {
+                const x = try gc.create(.real, w);
+                try a.append(x);
+                w += 1.0;
+            } else {
+                const x = try gc.create(.cons, .{
+                    a.items[rand.uintLessThan(usize, a.items.len)],
+                    a.items[rand.uintLessThan(usize, a.items.len)],
+                });
+                try a.append(x);
+            }
         }
 
         while (a.items.len > 512) {
@@ -303,14 +434,10 @@ test "sgc scratch" {
             _ = a.swapRemove(i);
         }
         for (a.items) |x| {
-            sgc.trace(x);
+            gc.trace(x);
         }
 
-        sgc.sweep();
-        sgc.compact();
-        std.debug.print(
-            "current page count {}\tcurrent table size {}\n",
-            .{ sgc.inactive_pages.items.len + 1, sgc.page_counter - sgc.reusable.items.len },
-        );
+        gc.sweep();
+        gc.compact();
     }
 }
