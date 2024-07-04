@@ -1,243 +1,295 @@
 const std = @import("std");
 
-// test a gc idea roughly based on the mesh allocator
-// https://arxiv.org/pdf/1902.04738
+const BLOCK_SIZE = 4 * 1024;
+
+const Kind = enum(u8) {
+    real,
+    cons,
+    hamt,
+};
+
+fn KindType(comptime kind: Kind) type {
+    return switch (kind) {
+        .real => f64,
+        .cons => [2]Ref,
+        .hamt => [16]Ref,
+    };
+}
 
 const Ref = extern struct {
-    _r: u32,
-
-    fn new(page_ix: u32, slot_ix: u32) Ref {
-        return .{ ._r = (page_ix << 8) | slot_ix };
-    }
-
-    fn page(r: Ref) u32 {
-        return r._r >> 8;
-    }
-
-    fn slot(r: Ref) u32 {
-        return r._r & 0xff;
-    }
+    page: u32 align(8),
+    slot: u8,
+    kind: Kind,
 };
 
-const Block = struct { bytes: [32]u8 align(32) };
-
-const Page = struct {
-    id: u32,
-    n: usize,
-    shuffle: [256]u8 align(64),
-    data: [256]Block,
-    used: std.StaticBitSet(256),
-    marks: std.StaticBitSet(256),
-
-    fn init(rand: std.rand.Random, id: u32) Page {
-        var page: Page = undefined;
-        page.id = id;
-        page.n = 0;
-        for (0..256) |i| page.shuffle[i] = @intCast(i);
-        for (0..256) |i| {
-            // FIXME actually do fisher-yates correctly...
-            const j = rand.int(u8);
-            const tmp = page.shuffle[i];
-            page.shuffle[i] = page.shuffle[j];
-            page.shuffle[j] = tmp;
-        }
-        page.used = std.StaticBitSet(256).initEmpty();
-        page.marks = std.StaticBitSet(256).initEmpty();
-        return page;
-    }
-
-    fn create(page: *Page) u32 {
-        std.debug.assert(page.n < 256);
-        const slot = page.shuffle[page.n];
-        page.used.set(slot);
-        page.n += 1;
-        return slot;
-    }
-
-    fn destroy(page: *Page, rand: std.rand.Random, slot: u8) void {
-        std.debug.assert(page.used.isSet(slot));
-        page.n -= 1;
-        page.used.unset(slot);
-        const j: u8 = @intCast(rand.intRangeLessThan(usize, page.n, 256));
-        page.shuffle[page.n] = page.shuffle[j];
-        page.shuffle[j] = slot;
-    }
-
-    fn mark(page: *Page, slot: u32) void {
-        std.debug.assert(slot < 256);
-        page.marks.set(slot);
-    }
-
-    fn sweep(page: *Page, rand: std.rand.Random) void {
-        const garbage = page.used.differenceWith(page.marks);
-        var it = garbage.iterator(.{});
-        while (it.next()) |i| {
-            page.destroy(rand, @intCast(i));
-        }
-        page.marks = std.StaticBitSet(256).initEmpty();
-    }
-};
-
-fn canMerge(a: Page, b: Page) bool {
-    return a.used.intersectWith(b.used).findFirstSet() == null;
+comptime {
+    std.debug.assert(@sizeOf(Ref) == 8);
+    std.debug.assert(@alignOf(Ref) == 8);
 }
 
-fn mergeInto(src: *Page, dst: *Page, rand: std.rand.Random) void {
-    std.debug.assert(canMerge(src.*, dst.*));
-    // copy data
-    var it = src.used.iterator(.{});
-    while (it.next()) |i| {
-        std.debug.assert(!dst.used.isSet(i));
-        dst.data[i] = src.data[i];
-        dst.used.set(i);
-        dst.n += 1;
-    }
-    // rebuild the shuffle vector in dst
-    var it2 = dst.used.iterator(.{ .kind = .unset });
-    var k: usize = 255;
-    while (it2.next()) |w| {
-        dst.shuffle[k] = @intCast(w);
-        if (k == 0) {
-            std.debug.assert(it2.next() == null);
-            break;
-        }
-        k -= 1;
-    }
-    for (dst.n..256) |i| {
-        // FIXME actually do fisher-yates correctly...
-        const j = rand.intRangeLessThan(usize, i, 256);
-        const tmp = dst.shuffle[i];
-        dst.shuffle[i] = dst.shuffle[j];
-        dst.shuffle[j] = tmp;
-    }
-}
+fn SingularGCType(comptime kind: Kind) type {
+    const T = KindType(kind);
+    const N = @min(256, (BLOCK_SIZE - 128) / @sizeOf(T));
+    const MERGE_MAX = N / 3;
 
-const GC = struct {
-    const Indirect = struct {
-        page: *Page,
-        moved: ?u32,
+    const Page = struct {
+        index: u32,
+        len: usize,
+        data: [N]T align(64),
+        marks: std.StaticBitSet(N),
+        used: std.StaticBitSet(N),
+
+        pub fn create(alloc: std.mem.Allocator) !*@This() {
+            var page = try alloc.create(@This());
+            page.len = 0;
+            page.used = std.StaticBitSet(256).initEmpty();
+            return page;
+        }
+
+        fn destroy(page: *@This(), alloc: std.mem.Allocator) void {
+            var it = page.used.iterator(.{});
+            while (it.next()) |i| {
+                _ = i; // TODO
+            }
+            alloc.destroy(page);
+        }
     };
 
-    alloc: std.mem.Allocator,
-    rand: std.rand.Random,
-    pages: std.ArrayList(*Page),
-    page_table: std.ArrayList(Indirect), // page_table.items[Ref.page()] -> *Page
-    active_page: ?*Page = null,
-    next_id: u32 = 0,
+    std.debug.assert(N >= 3 and N <= 256);
+    std.debug.assert(@sizeOf(Page) <= BLOCK_SIZE);
 
-    fn init(alloc: std.mem.Allocator, rand: std.rand.Random) GC {
-        return .{
-            .alloc = alloc,
-            .rand = rand,
-            .pages = std.ArrayList(*Page).init(alloc),
-            .page_table = std.ArrayList(Indirect).init(alloc),
-        };
-    }
+    const TableEntry = struct {
+        page: usize, // ptr to page if not free, index in page_table if free
+        mark: bool,
+        free: bool,
+    };
 
-    fn deinit(gc: *GC) void {
-        for (gc.pages.items) |page| {
-            gc.alloc.destroy(page);
-        }
-        gc.pages.deinit();
-        gc.page_table.deinit();
-    }
+    return struct {
+        const SGC = @This();
 
-    fn create(gc: *GC) !Ref {
-        // this is kinda stupid, obviously some kind of sorting would be preferable
-        // maybe we could even keep the pages in a min-max heap by occupancy?
-        if (gc.active_page != null and gc.active_page.?.n == 256 and gc.pages.items.len > 0) {
-            // try another random page
-            gc.active_page = gc.pages.items[gc.rand.uintLessThan(usize, gc.pages.items.len)];
-        }
+        alloc: std.mem.Allocator,
+        rand: std.Random.Random,
+        shuffle: [N]u8,
+        active_page: *Page,
+        inactive_pages: std.ArrayList(*Page),
+        pairing_buffer: std.ArrayList(*Page),
+        page_table: std.MultiArrayList(TableEntry),
+        free_list: usize,
 
-        if (gc.active_page == null or gc.active_page.?.n == 256) {
-            try gc.pages.ensureTotalCapacity(gc.pages.items.len + 1);
-            try gc.page_table.ensureTotalCapacity(gc.page_table.items.len + 1);
-            const new_page = try gc.alloc.create(Page);
-            new_page.* = Page.init(gc.rand, gc.next_id);
-            gc.next_id += 1;
-            gc.active_page = new_page;
-            gc.pages.appendAssumeCapacity(new_page);
-            gc.page_table.appendAssumeCapacity(.{ .page = new_page, .moved = null });
+        fn init(alloc: std.mem.Allocator, rand: std.Random.Random) !SGC {
+            var sgc = SGC{
+                .alloc = alloc,
+                .rand = rand,
+                .shuffle = undefined,
+                .active_page = undefined,
+                .inactive_pages = std.ArrayList(*Page).init(alloc),
+                .pairing_buffer = std.ArrayList(*Page).init(alloc),
+                .page_table = std.MultiArrayList(TableEntry){},
+                .free_list = std.math.maxInt(usize),
+            };
+            try sgc.newActivePage(true);
+            return sgc;
         }
 
-        const active_page = gc.active_page.?;
-        const slot = active_page.create();
-        return Ref.new(active_page.id, slot);
-    }
-
-    fn mark(gc: *GC, r: Ref) void {
-        const page = gc.getPage(r);
-        page.mark(r.slot());
-    }
-
-    fn sweep(gc: *GC) void {
-        for (gc.pages.items) |page| {
-            page.sweep(gc.rand);
+        fn deinit(sgc: *SGC) void {
+            sgc.active_page.destroy(sgc.alloc);
+            for (sgc.inactive_pages.items) |page| page.destroy(sgc.alloc);
+            sgc.inactive_pages.deinit();
+            sgc.pairing_buffer.deinit();
+            sgc.page_table.deinit(sgc.alloc);
+            sgc.* = undefined;
         }
-    }
 
-    fn compact(gc: *GC) void {
-        if (gc.pages.items.len < 2) return;
-        const n = gc.pages.items.len / 2;
-        // almost surely a worse approach than the original, but whatever
-        for (0..n) |i| {
-            if (n == gc.pages.items.len) break;
-            const a = gc.rand.intRangeLessThan(usize, n, gc.pages.items.len);
-            const b = i;
-            if (a == b) continue;
-            if (!canMerge(gc.pages.items[a].*, gc.pages.items[b].*)) continue;
+        fn newActivePage(sgc: *SGC, comptime first_time: bool) !void {
+            // NOTE order ensures an error doesn't break the structure we have
+            if (!first_time) {
+                try sgc.inactive_pages.ensureUnusedCapacity(1);
+                try sgc.pairing_buffer.ensureTotalCapacity(sgc.inactive_pages.len + 1);
+            }
+            if (sgc.free_list == std.math.maxInt(usize)) {
+                try sgc.page_table.ensureUnusedCapacity(sgc.alloc, 1);
+            }
+            const new_page = try Page.create(sgc.alloc);
+            if (!first_time) sgc.inactive_pages.appendAssumeCapacity(sgc.active_page);
+            sgc.active_page = new_page;
 
-            mergeInto(gc.pages.items[a], gc.pages.items[b], gc.rand);
-            gc.page_table.items[gc.pages.items[a].id].moved = gc.pages.items[b].id;
-            gc.alloc.destroy(gc.pages.items[a]);
-            _ = gc.pages.swapRemove(a);
+            // add new active page to page table
+            var page_index: u32 = undefined;
+            if (sgc.free_list == std.math.maxInt(usize)) {
+                page_index = @intCast(sgc.page_table.len);
+                sgc.page_table.appendAssumeCapacity(.{
+                    .page = @intFromPtr(new_page),
+                    .mark = true,
+                    .free = false,
+                });
+            } else {
+                page_index = @intCast(sgc.free_list);
+                sgc.free_list = sgc.page_table.items(.page)[page_index];
+                sgc.page_table.items(.page)[page_index] = @intFromPtr(new_page);
+            }
+            sgc.active_page.index = page_index;
+
+            // setup the shuffle vector
+            for (0..N) |i| sgc.shuffle[i] = @intCast(i);
+            for (0..N) |i| {
+                const j = sgc.rand.intRangeLessThan(usize, i, N);
+                const tmp = sgc.shuffle[i];
+                sgc.shuffle[i] = sgc.shuffle[j];
+                sgc.shuffle[j] = tmp;
+            }
         }
-        gc.active_page = null;
-    }
 
-    fn getPage(gc: *GC, r: Ref) *Page {
-        const indirect = &gc.page_table.items[r.page()];
-        if (indirect.moved) |move| {
-            const dest = gc.page_table.items[move];
-            std.debug.assert(dest.moved == null);
-            indirect.page = dest.page;
-            indirect.moved = null;
+        fn create(sgc: *SGC, val: T) !Ref {
+            if (sgc.active_page.len == N) try sgc.newActivePage();
+
+            const i = sgc.shuffle[sgc.active_page.len];
+            sgc.active_page.data[i] = val;
+            sgc.active_page.marks.set(i); // needed if we make this concurrent
+            sgc.active_page.used.set(i);
+            sgc.active_page.len += 1;
+
+            return .{
+                .page = sgc.active_page.index,
+                .kind = kind,
+                .slot = i,
+            };
         }
-        return indirect.page;
-    }
-};
+
+        fn get(sgc: *SGC, ref: Ref) T {
+            std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
+            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
+            std.debug.assert(page.used.isSet(ref.slot));
+            return page.data[ref.slot];
+        }
+
+        fn trace(sgc: *SGC, ref: Ref, gc: *GC) void {
+            std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
+            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
+            sgc.page_table.items(.mark)[ref.page] = true;
+            page.marks.set(ref.slot);
+            switch (kind) {
+                .real => {},
+                .cons => {
+                    const cons = sgc.get(ref);
+                    gc.trace(cons[0]);
+                    gc.trace(cons[1]);
+                },
+                .hamt => {
+                    const hamt = sgc.get(ref);
+                    for (hamt) |child| gc.trace(child);
+                },
+            }
+        }
+
+        fn sweep(sgc: *SGC) void {
+            // NOTE we only sweep the inactive pages
+            // remove all values that haven't been marked
+            var i = sgc.inactive_pages.items.len;
+            while (i > 0) : (i -= 1) {
+                const page = sgc.inactive_pages.items[i - 1];
+                const unmarked = page.used.differenceWith(page.marks);
+                var it = unmarked.iterator(.{});
+                while (it.next()) |j| {
+                    page.used.unset(j);
+                    // TODO finalize(...); we don't have the ref here huh...
+                    page.len -= 1;
+                }
+            }
+            // enable reuse of any page table entries that no references were traced through
+            i = sgc.page_table.len;
+            const slices = sgc.page_table.slice();
+            while (i > 0) : (i -= 1) {
+                if (slices.items(.mark)[i - 1]) continue;
+                if (slices.items(.free)[i - 1]) continue;
+                slices.items(.page)[i - 1] = sgc.free_list;
+                sgc.free_list = i - 1;
+                // NOTE we don't need to call finalizers, since it's already done in previous step
+            }
+
+            // prepare for next round of sweeping
+            for (sgc.inactive_pages.items) |page| {
+                page.marks = std.StaticBitSet(256).initEmpty();
+            }
+            for (sgc.page_table.items(.mark)) |*mark| {
+                // we don't care about marks for things in the free list
+                // so branching to avoid unmarking those isn't necessary
+                mark.* = false;
+            }
+        }
+
+        fn canMerge(a: *Page, b: *Page) bool {
+            return a.used.intersectWith(b.used).findFirstSet() == null;
+        }
+
+        fn mergeInto(src: *Page, dst: *Page) void {
+            std.debug.assert(canMerge(src, dst));
+            var it = src.used.iterator(.{});
+            while (it.next()) |i| {
+                std.debug.assert(!dst.used.isSet(i));
+                dst.data[i] = src.data[i];
+                dst.used.set(i);
+                dst.len += 1;
+            }
+        }
+
+        fn compact(sgc: *SGC) void {
+            // NOTE we only try to merge the inactive pages
+            sgc.pairing_buffer.clearRetainingCapacity();
+            for (sgc.inactive_pages.items) |page| {
+                if (page.len > MERGE_MAX) continue; // merge probability -> 0 as occupancy -> 50%
+                const i = sgc.rand.uintLessThan(usize, sgc.pairing_buffer.items.len + 1);
+                if (i == sgc.pairing_buffer.items.len) {
+                    sgc.pairing_buffer.appendAssumeCapacity(page);
+                } else {
+                    sgc.pairing_buffer.appendAssumeCapacity(sgc.pairing_buffer.items[i]);
+                    sgc.pairing_buffer.items[i] = page;
+                }
+            }
+            // randomly try to merge pages
+            // i wonder if using offsets from a list of primes would be better?
+            for (0..60) |offset| {
+                var k: usize = 0;
+                while (k < sgc.pairing_buffer.items.len) : (k += 1) {
+                    if (sgc.pairing_buffer.items.len == 1) return;
+                    const i = k % sgc.pairing_buffer.items.len;
+                    const j = (k + offset) % sgc.pairing_buffer.items.len;
+                    if (!canMerge(
+                        sgc.pairing_buffer.items[i],
+                        sgc.pairing_buffer.items[j],
+                    )) continue;
+                    std.debug.print("merge {} {}\n", .{
+                        sgc.pairing_buffer.items[i].len,
+                        sgc.pairing_buffer.items[j].len,
+                    });
+                    mergeInto(sgc.pairing_buffer.items[i], sgc.pairing_buffer.items[j]);
+                    // redirect all entries pointing to the page we just merged
+                    for (sgc.page_table.items) |*pt| {
+                        if (pt.* != sgc.pairing_buffer.items[i]) continue;
+                        // so long as this is atomic, this can run concurrently
+                        pt.* = sgc.pairing_buffer.items[j];
+                    }
+                    // destroy the page we merged away from in the list of inactive_pages
+                    var ixd: usize = 0;
+                    while (sgc.inactive_pages.items[ixd] != sgc.pairing_buffer.items[i]) {
+                        ixd += 1;
+                    }
+                    sgc.alloc.destroy(sgc.inactive_pages.swapRemove(ixd));
+                    // and drop it from considereation in future merges
+                    _ = sgc.pairing_buffer.swapRemove(i);
+                }
+            }
+        }
+    };
+}
+
+const GC = struct {};
 
 test "scratch" {
-    // microtimestamp has pretty unevenly distributed entropy
-    // multiplying by a large prime distributes it more evenly
-    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp() *% 3129313031303131));
+    var rng = std.Random.DefaultPrng.init(
+        @bitCast(std.time.microTimestamp() *% 7951182790392048631),
+    );
     const rand = rng.random();
 
-    var gc = GC.init(std.testing.allocator, rand);
-    defer gc.deinit();
-
-    var a = std.ArrayList(Ref).init(std.testing.allocator);
-    defer a.deinit();
-
-    for (0..10) |_| {
-        for (0..1024) |_| {
-            const x = try gc.create();
-            try a.append(x);
-        }
-
-        for (0..a.items.len) |i| {
-            const j = rand.uintLessThan(usize, a.items.len);
-            const tmp = a.items[i];
-            a.items[i] = a.items[j];
-            a.items[j] = tmp;
-        }
-        while (a.items.len > 64) _ = a.pop();
-        for (a.items) |x| gc.mark(x);
-
-        gc.sweep();
-        gc.compact();
-
-        std.debug.print("number of pages is {}\n", .{gc.pages.items.len});
-    }
+    var sgc = try SingularGCType(.real).init(std.testing.allocator, rand);
+    defer sgc.deinit();
 }
