@@ -315,7 +315,7 @@ const GC = struct {
             .rng = try alloc.create(std.Random.DefaultPrng),
         };
         gc.rng.* = std.Random.DefaultPrng.init(
-            @bitCast(std.time.microTimestamp() *% 7951182790392048631),
+            (@as(u64, @bitCast(std.time.microTimestamp())) | 1) *% 11400714819323198393,
         );
         errdefer alloc.destroy(gc.rng);
         inline for (0..n_kinds) |i| {
