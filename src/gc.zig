@@ -42,7 +42,7 @@ fn SingularGCType(comptime kind: Kind) type {
         pub fn create(alloc: std.mem.Allocator) !*@This() {
             var page = try alloc.create(@This());
             page.len = 0;
-            page.used = std.StaticBitSet(256).initEmpty();
+            page.used = std.StaticBitSet(N).initEmpty();
             return page;
         }
 
@@ -104,13 +104,15 @@ fn SingularGCType(comptime kind: Kind) type {
             // NOTE order ensures an error doesn't break the structure we have
             if (!first_time) {
                 try sgc.inactive_pages.ensureUnusedCapacity(1);
-                try sgc.pairing_buffer.ensureTotalCapacity(sgc.inactive_pages.len + 1);
+                try sgc.pairing_buffer.ensureTotalCapacity(sgc.inactive_pages.items.len + 1);
             }
             if (sgc.free_list == std.math.maxInt(usize)) {
                 try sgc.page_table.ensureUnusedCapacity(sgc.alloc, 1);
             }
             const new_page = try Page.create(sgc.alloc);
-            if (!first_time) sgc.inactive_pages.appendAssumeCapacity(sgc.active_page);
+            if (!first_time) {
+                sgc.inactive_pages.appendAssumeCapacity(sgc.active_page);
+            }
             sgc.active_page = new_page;
 
             // add new active page to page table
@@ -126,6 +128,7 @@ fn SingularGCType(comptime kind: Kind) type {
                 page_index = @intCast(sgc.free_list);
                 sgc.free_list = sgc.page_table.items(.page)[page_index];
                 sgc.page_table.items(.page)[page_index] = @intFromPtr(new_page);
+                sgc.page_table.items(.free)[page_index] = false;
             }
             sgc.active_page.index = page_index;
 
@@ -140,7 +143,7 @@ fn SingularGCType(comptime kind: Kind) type {
         }
 
         fn create(sgc: *SGC, val: T) !Ref {
-            if (sgc.active_page.len == N) try sgc.newActivePage();
+            if (sgc.active_page.len == N) try sgc.newActivePage(false);
 
             const i = sgc.shuffle[sgc.active_page.len];
             sgc.active_page.data[i] = val;
@@ -165,6 +168,7 @@ fn SingularGCType(comptime kind: Kind) type {
         fn trace(sgc: *SGC, ref: Ref, gc: *GC) void {
             std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
             const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
+            // if (page.marks.isSet(ref.slot)) return;
             sgc.page_table.items(.mark)[ref.page] = true;
             page.marks.set(ref.slot);
             switch (kind) {
@@ -182,11 +186,17 @@ fn SingularGCType(comptime kind: Kind) type {
         }
 
         fn sweep(sgc: *SGC) void {
+            std.debug.print("{}\t[ ", .{kind});
+            var walk = sgc.free_list;
+            while (walk != std.math.maxInt(usize)) {
+                std.debug.print("{} ", .{walk});
+                walk = sgc.page_table.items(.page)[walk];
+            }
+            std.debug.print("]\n", .{});
+
             // NOTE we only sweep the inactive pages
             // remove all values that haven't been marked
-            var i = sgc.inactive_pages.items.len;
-            while (i > 0) : (i -= 1) {
-                const page = sgc.inactive_pages.items[i - 1];
+            for (sgc.inactive_pages.items) |page| {
                 const unmarked = page.used.differenceWith(page.marks);
                 var it = unmarked.iterator(.{});
                 while (it.next()) |j| {
@@ -196,19 +206,21 @@ fn SingularGCType(comptime kind: Kind) type {
                 }
             }
             // enable reuse of any page table entries that no references were traced through
-            i = sgc.page_table.len;
+            var i = sgc.page_table.len;
             const slices = sgc.page_table.slice();
             while (i > 0) : (i -= 1) {
                 if (slices.items(.mark)[i - 1]) continue;
                 if (slices.items(.free)[i - 1]) continue;
+                if (slices.items(.page)[i - 1] == @intFromPtr(sgc.active_page)) continue;
                 slices.items(.page)[i - 1] = sgc.free_list;
+                slices.items(.free)[i - 1] = true;
                 sgc.free_list = i - 1;
                 // NOTE we don't need to call finalizers, since it's already done in previous step
             }
 
             // prepare for next round of sweeping
             for (sgc.inactive_pages.items) |page| {
-                page.marks = std.StaticBitSet(256).initEmpty();
+                page.marks = std.StaticBitSet(N).initEmpty();
             }
             for (sgc.page_table.items(.mark)) |*mark| {
                 // we don't care about marks for things in the free list
@@ -257,16 +269,14 @@ fn SingularGCType(comptime kind: Kind) type {
                         sgc.pairing_buffer.items[i],
                         sgc.pairing_buffer.items[j],
                     )) continue;
-                    std.debug.print("merge {} {}\n", .{
-                        sgc.pairing_buffer.items[i].len,
-                        sgc.pairing_buffer.items[j].len,
-                    });
                     mergeInto(sgc.pairing_buffer.items[i], sgc.pairing_buffer.items[j]);
+                    std.debug.print("MERGE!\n", .{});
                     // redirect all entries pointing to the page we just merged
-                    for (sgc.page_table.items) |*pt| {
-                        if (pt.* != sgc.pairing_buffer.items[i]) continue;
+                    for (sgc.page_table.items(.page), sgc.page_table.items(.free)) |*pt, free| {
+                        if (free) continue;
+                        if (pt.* != @intFromPtr(sgc.pairing_buffer.items[i])) continue;
                         // so long as this is atomic, this can run concurrently
-                        pt.* = sgc.pairing_buffer.items[j];
+                        pt.* = @intFromPtr(sgc.pairing_buffer.items[j]);
                     }
                     // destroy the page we merged away from in the list of inactive_pages
                     var ixd: usize = 0;
@@ -279,10 +289,97 @@ fn SingularGCType(comptime kind: Kind) type {
                 }
             }
         }
+
+        fn occupancy(sgc: *SGC) f64 {
+            var n: usize = 0;
+            n += sgc.active_page.used.count();
+            for (sgc.inactive_pages.items) |page| n += page.used.count();
+            return @as(f64, @floatFromInt(n)) /
+                @as(f64, @floatFromInt(N * (1 + sgc.inactive_pages.items.len)));
+        }
     };
 }
 
-const GC = struct {};
+const GC = struct {
+    const n_kinds = std.meta.fields(Kind).len;
+
+    alloc: std.mem.Allocator,
+    sgcs: [n_kinds]*anyopaque,
+
+    rng: *std.Random.DefaultPrng,
+
+    fn init(alloc: std.mem.Allocator) !GC {
+        var gc = GC{
+            .alloc = alloc,
+            .sgcs = undefined,
+            .rng = try alloc.create(std.Random.DefaultPrng),
+        };
+        gc.rng.* = std.Random.DefaultPrng.init(
+            @bitCast(std.time.microTimestamp() *% 7951182790392048631),
+        );
+        errdefer alloc.destroy(gc.rng);
+        inline for (0..n_kinds) |i| {
+            const kind: Kind = @enumFromInt(i);
+            const SGC = SingularGCType(kind);
+            const sgc = try alloc.create(SGC);
+            errdefer alloc.destroy(sgc);
+            // NOTE how do the scopes work out with that errdefer?
+            // as in, if we fail, will all the SGCs allocated so far be destroyed?
+            // presumably, though inline for unrolls the loop, it maintains each iterations scope
+            // hence, the errdefer will only trigger for that iteration
+            // and making this completely safe is kinda tricky (and mostly a waste of time)
+            // so, maybe later...
+            sgc.* = try SGC.init(alloc, gc.rng.random());
+            gc.sgcs[i] = sgc;
+        }
+        return gc;
+    }
+
+    fn deinit(gc: *GC) void {
+        gc.alloc.destroy(gc.rng);
+        inline for (0..n_kinds) |i| {
+            const kind: Kind = @enumFromInt(i);
+            const sgc = gc.getSGC(kind);
+            sgc.deinit();
+            gc.alloc.destroy(sgc);
+        }
+        gc.* = undefined;
+    }
+
+    fn getSGC(gc: *GC, comptime kind: Kind) *SingularGCType(kind) {
+        return @alignCast(@ptrCast(gc.sgcs[@intFromEnum(kind)]));
+    }
+
+    fn create(gc: *GC, comptime kind: Kind, val: KindType(kind)) !Ref {
+        return gc.getSGC(kind).create(val);
+    }
+
+    fn trace(gc: *GC, ref: Ref) void {
+        switch (ref.kind) {
+            .real => {
+                gc.getSGC(.real).trace(ref, gc);
+            },
+            .cons => {
+                gc.getSGC(.cons).trace(ref, gc);
+            },
+            .hamt => {
+                gc.getSGC(.hamt).trace(ref, gc);
+            },
+        }
+    }
+
+    fn sweep(gc: *GC) void {
+        inline for (0..n_kinds) |i| {
+            gc.getSGC(@enumFromInt(i)).sweep();
+        }
+    }
+
+    fn compact(gc: *GC) void {
+        inline for (0..n_kinds) |i| {
+            gc.getSGC(@enumFromInt(i)).compact();
+        }
+    }
+};
 
 test "scratch" {
     var rng = std.Random.DefaultPrng.init(
@@ -290,6 +387,50 @@ test "scratch" {
     );
     const rand = rng.random();
 
-    var sgc = try SingularGCType(.real).init(std.testing.allocator, rand);
-    defer sgc.deinit();
+    var gc = try GC.init(std.testing.allocator);
+    defer gc.deinit();
+
+    var a = std.ArrayList(Ref).init(std.testing.allocator);
+    defer a.deinit();
+
+    var w: f64 = 0.0;
+    for (0..100) |_| {
+        while (a.items.len < 1024) {
+            if (a.items.len < 2 or rand.boolean()) {
+                const x = try gc.create(.real, w);
+                try a.append(x);
+                w += 1.0;
+            } else {
+                const x = try gc.create(.cons, .{
+                    a.items[rand.uintLessThan(usize, a.items.len)],
+                    a.items[rand.uintLessThan(usize, a.items.len)],
+                });
+                try a.append(x);
+            }
+        }
+
+        while (a.items.len > 512) {
+            const i = rand.uintLessThan(usize, a.items.len);
+            _ = a.swapRemove(i);
+        }
+        for (a.items) |x| {
+            gc.trace(x);
+        }
+
+        gc.sweep();
+        gc.compact();
+
+        inline for (std.meta.fields(Kind)) |kind| {
+            const sgc = gc.getSGC(@enumFromInt(kind.value));
+            std.debug.print(
+                "{}\tnum pages: {}\ttable size: {}\toccupancy: {d:.2}%\n",
+                .{
+                    kind,
+                    sgc.inactive_pages.items.len + 1,
+                    sgc.page_table.len,
+                    sgc.occupancy() * 100,
+                },
+            );
+        }
+    }
 }

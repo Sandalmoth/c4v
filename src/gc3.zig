@@ -439,5 +439,13 @@ test "gc scratch" {
 
         gc.sweep();
         gc.compact();
+
+        inline for (std.meta.fields(Kind)) |kind| {
+            const sgc = gc.gets(@enumFromInt(kind.value));
+            std.debug.print(
+                "{}\tnum pages: {}\ttable size: {}\n",
+                .{ kind, sgc.inactive_pages.items.len + 1, sgc.page_table.items.len },
+            );
+        }
     }
 }
