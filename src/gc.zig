@@ -16,6 +16,15 @@ fn KindType(comptime kind: Kind) type {
     };
 }
 
+fn finalize(comptime kind: Kind, val: KindType(kind)) void {
+    _ = val;
+    switch (kind) {
+        .real => {},
+        .cons => {},
+        .hamt => {},
+    }
+}
+
 const Ref = extern struct {
     page: u32 align(8),
     slot: u8,
@@ -49,7 +58,7 @@ fn SingularGCType(comptime kind: Kind) type {
         fn destroy(page: *@This(), alloc: std.mem.Allocator) void {
             var it = page.used.iterator(.{});
             while (it.next()) |i| {
-                _ = i; // TODO
+                finalize(kind, page.data[i]);
             }
             alloc.destroy(page);
         }
@@ -168,7 +177,6 @@ fn SingularGCType(comptime kind: Kind) type {
         fn trace(sgc: *SGC, ref: Ref, gc: *GC) void {
             std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
             const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
-            // if (page.marks.isSet(ref.slot)) return;
             sgc.page_table.items(.mark)[ref.page] = true;
             page.marks.set(ref.slot);
             switch (kind) {
@@ -201,7 +209,7 @@ fn SingularGCType(comptime kind: Kind) type {
                 var it = unmarked.iterator(.{});
                 while (it.next()) |j| {
                     page.used.unset(j);
-                    // TODO finalize(...); we don't have the ref here huh...
+                    finalize(kind, page.data[j]);
                     page.len -= 1;
                 }
             }
