@@ -2,13 +2,16 @@ const std = @import("std");
 
 const BLOCK_SIZE = 4 * 1024;
 
-const Kind = enum(u8) {
+const Hash = u32;
+const NILHASH: Hash = 0x00b4b4b4;
+
+pub const Kind = enum(u8) {
     real,
     cons,
     hamt,
 };
 
-fn KindType(comptime kind: Kind) type {
+pub fn KindType(comptime kind: Kind) type {
     return switch (kind) {
         .real => f64,
         .cons => [2]Ref,
@@ -25,11 +28,40 @@ fn finalize(comptime kind: Kind, val: KindType(kind)) void {
     }
 }
 
-const Ref = extern struct {
-    page: u32 align(8),
-    slot: u8,
-    kind: Kind,
+pub const Ref = extern struct {
+    _location: u32 align(8),
+    _property: u32,
+
+    pub fn init(_kind: Kind, _page: u32, _slot: u8, _hash: u32) Ref {
+        std.debug.assert(_page <= 0x00ffffff);
+        return .{
+            ._location = _page | (@as(u32, _slot) << 24),
+            ._property = (_hash & 0x00ffffff) | (@as(u32, @intFromEnum(_kind)) << 24),
+        };
+    }
+
+    fn page(ref: Ref) u32 {
+        return ref._location & 0x00ffffff;
+    }
+
+    fn slot(ref: Ref) u8 {
+        return @intCast(ref._location >> 24);
+    }
+
+    pub fn hash(ref: Ref) u32 {
+        return ref._property & 0x00ffffff;
+    }
+
+    pub fn kind(ref: Ref) Kind {
+        return @enumFromInt(ref._property >> 24);
+    }
+
+    pub fn isNil(ref: Ref) bool {
+        return ref.page() == 0x00ffffff;
+    }
 };
+
+pub const nil = Ref.init(undefined, 0x00ffffff, undefined, NILHASH);
 
 comptime {
     std.debug.assert(@sizeOf(Ref) == 8);
@@ -151,7 +183,7 @@ fn SingularGCType(comptime kind: Kind) type {
             }
         }
 
-        fn create(sgc: *SGC, val: T) !Ref {
+        fn create(sgc: *SGC, val: T, hash: u32) !Ref {
             if (sgc.active_page.len == N) try sgc.newActivePage(false);
 
             const i = sgc.shuffle[sgc.active_page.len];
@@ -160,25 +192,21 @@ fn SingularGCType(comptime kind: Kind) type {
             sgc.active_page.used.set(i);
             sgc.active_page.len += 1;
 
-            return .{
-                .page = sgc.active_page.index,
-                .kind = kind,
-                .slot = i,
-            };
+            return Ref.init(kind, sgc.active_page.index, i, hash);
         }
 
         fn get(sgc: *SGC, ref: Ref) T {
-            std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
-            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
-            std.debug.assert(page.used.isSet(ref.slot));
-            return page.data[ref.slot];
+            std.debug.assert(!sgc.page_table.items(.free)[ref.page()]);
+            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page()]);
+            std.debug.assert(page.used.isSet(ref.slot()));
+            return page.data[ref.slot()];
         }
 
         fn trace(sgc: *SGC, ref: Ref, gc: *GC) void {
-            std.debug.assert(!sgc.page_table.items(.free)[ref.page]);
-            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page]);
-            sgc.page_table.items(.mark)[ref.page] = true;
-            page.marks.set(ref.slot);
+            std.debug.assert(!sgc.page_table.items(.free)[ref.page()]);
+            const page: *Page = @ptrFromInt(sgc.page_table.items(.page)[ref.page()]);
+            sgc.page_table.items(.mark)[ref.page()] = true;
+            page.marks.set(ref.slot());
             switch (kind) {
                 .real => {},
                 .cons => {
@@ -308,7 +336,7 @@ fn SingularGCType(comptime kind: Kind) type {
     };
 }
 
-const GC = struct {
+pub const GC = struct {
     const n_kinds = std.meta.fields(Kind).len;
 
     alloc: std.mem.Allocator,
@@ -316,7 +344,7 @@ const GC = struct {
 
     rng: *std.Random.DefaultPrng,
 
-    fn init(alloc: std.mem.Allocator) !GC {
+    pub fn init(alloc: std.mem.Allocator) !GC {
         var gc = GC{
             .alloc = alloc,
             .sgcs = undefined,
@@ -336,14 +364,14 @@ const GC = struct {
             // presumably, though inline for unrolls the loop, it maintains each iterations scope
             // hence, the errdefer will only trigger for that iteration
             // and making this completely safe is kinda tricky (and mostly a waste of time)
-            // so, maybe later...
+            // so, maybe later... TODO
             sgc.* = try SGC.init(alloc, gc.rng.random());
             gc.sgcs[i] = sgc;
         }
         return gc;
     }
 
-    fn deinit(gc: *GC) void {
+    pub fn deinit(gc: *GC) void {
         gc.alloc.destroy(gc.rng);
         inline for (0..n_kinds) |i| {
             const kind: Kind = @enumFromInt(i);
@@ -358,12 +386,38 @@ const GC = struct {
         return @alignCast(@ptrCast(gc.sgcs[@intFromEnum(kind)]));
     }
 
-    fn create(gc: *GC, comptime kind: Kind, val: KindType(kind)) !Ref {
-        return gc.getSGC(kind).create(val);
+    pub fn create(gc: *GC, comptime kind: Kind, val: KindType(kind)) !Ref {
+        const hash = switch (kind) {
+            .real => std.hash.XxHash32.hash(2590326161, std.mem.asBytes(&val)),
+            .cons => blk: {
+                var h: u32 = 0;
+                h ^= if (val[0].isNil()) NILHASH else val[0].hash();
+                h *%= 3425487983; // does this lose 1/4 of the randomness of the car?
+                h ^= if (val[0].isNil()) NILHASH else val[1].hash();
+                break :blk h;
+            },
+            .hamt => blk: {
+                var h: u32 = 0;
+                for (val) |child| {
+                    h ^= if (child.isNil()) NILHASH else child.hash();
+                    h *%= 3680932543; // same question, do we lose entropy in the early hashes?
+                }
+                break :blk h;
+            },
+        };
+        return gc.getSGC(kind).create(val, hash);
     }
 
-    fn trace(gc: *GC, ref: Ref) void {
-        switch (ref.kind) {
+    pub fn get(gc: *GC, comptime kind: Kind, ref: Ref) KindType(kind) {
+        std.debug.assert(!ref.isNil);
+        std.debug.assert(ref.kind() == kind);
+        const sgc = gc.getSGC(kind);
+        return sgc.get(ref);
+    }
+
+    pub fn trace(gc: *GC, ref: Ref) void {
+        if (ref.isNil()) return;
+        switch (ref.kind()) {
             .real => {
                 gc.getSGC(.real).trace(ref, gc);
             },
@@ -376,13 +430,13 @@ const GC = struct {
         }
     }
 
-    fn sweep(gc: *GC) void {
+    pub fn sweep(gc: *GC) void {
         inline for (0..n_kinds) |i| {
             gc.getSGC(@enumFromInt(i)).sweep();
         }
     }
 
-    fn compact(gc: *GC) void {
+    pub fn compact(gc: *GC) void {
         inline for (0..n_kinds) |i| {
             gc.getSGC(@enumFromInt(i)).compact();
         }
