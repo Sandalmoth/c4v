@@ -409,7 +409,7 @@ pub const GC = struct {
     }
 
     pub fn get(gc: *GC, comptime kind: Kind, ref: Ref) KindType(kind) {
-        std.debug.assert(!ref.isNil);
+        std.debug.assert(!ref.isNil());
         std.debug.assert(ref.kind() == kind);
         const sgc = gc.getSGC(kind);
         return sgc.get(ref);

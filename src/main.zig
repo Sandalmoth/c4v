@@ -1,517 +1,224 @@
 const std = @import("std");
 
-const OBJECT_SIZE = 32;
+const _gc = @import("gc.zig");
+const Ref = _gc.Ref;
+const nil = _gc.nil;
 
-const Ref = u32;
-const nil = std.math.maxInt(Ref);
-
-const Hash = u32;
-const NILHASH: Hash = 0xb4b4b4b4;
-
-const Meta = extern union {
-    next: Ref,
-    rc: u32,
-};
-
-const ObjectKind = enum {
-    real,
-    cons,
-    hamt,
-};
-
-const Object = extern union {
-    real: f64,
-    cons: extern struct {
-        car: Ref,
-        cdr: Ref,
-    },
-    hamt: extern struct {
-        children: [8]Ref align(OBJECT_SIZE),
-    },
-};
-
-comptime {
-    std.debug.assert(@sizeOf(Object) <= OBJECT_SIZE);
-    std.debug.assert(@alignOf(Object) >= OBJECT_SIZE);
+pub fn main() !void {
+    // try scratch();
+    try benchmark();
+    try benchmarkReference();
+    // try fuzz();
 }
 
 const RT = struct {
-    metadata: std.ArrayList(Meta),
-    objects: std.ArrayList(Object),
-    hashes: std.ArrayList(Hash),
-    kinds: std.ArrayList(ObjectKind),
+    gc: _gc.GC,
 
-    free_list: Ref = nil,
-
-    fn init(alloc: std.mem.Allocator) RT {
+    fn init(alloc: std.mem.Allocator) !RT {
         return .{
-            .metadata = std.ArrayList(Meta).initCapacity(alloc, 65536) catch @panic("oom"),
-            .objects = std.ArrayList(Object).initCapacity(alloc, 65536) catch @panic("oom"),
-            .hashes = std.ArrayList(Hash).initCapacity(alloc, 65536) catch @panic("oom"),
-            .kinds = std.ArrayList(ObjectKind).initCapacity(alloc, 65536) catch @panic("oom"),
+            .gc = try _gc.GC.init(alloc),
         };
     }
 
     fn deinit(rt: *RT) void {
-        rt.metadata.deinit();
-        rt.objects.deinit();
-        rt.hashes.deinit();
-        rt.kinds.deinit();
+        rt.gc.deinit();
+        rt.* = undefined;
     }
 
-    fn metadataPtr(rt: *RT, ref: u32) *Meta {
-        std.debug.assert(ref < rt.metadata.items.len);
-        return &rt.metadata.items[ref];
+    fn create(rt: *RT, comptime kind: _gc.Kind, val: _gc.KindType(kind)) Ref {
+        return rt.gc.create(kind, val) catch @panic("GC allocation failure");
     }
 
-    fn objectPtr(rt: *RT, ref: u32) *Object {
-        std.debug.assert(ref < rt.objects.items.len);
-        return &rt.objects.items[ref];
+    // fn dup(rt: *RT, comptime kind: _gc.Kind, ref: *Ref) !Ref {
+    //     return rt.create(kind, rt.get(kind, ref));
+    // }
+
+    // fn dupUnk(rt: *RT, ref: *Ref) !Ref {
+    //     return switch (ref.kind()) {
+    //         .real => rt.dup(.real, ref),
+    //         .cons => rt.dup(.cons, ref),
+    //         .hamt => rt.dup(.hamt, ref),
+    //     };
+    // }
+
+    fn get(rt: *RT, comptime kind: _gc.Kind, ref: Ref) _gc.KindType(kind) {
+        return rt.gc.get(kind, ref);
     }
 
-    fn hashPtr(rt: *RT, ref: u32) *Hash {
-        std.debug.assert(ref < rt.hashes.items.len);
-        return &rt.hashes.items[ref];
-    }
-
-    fn kindPtr(rt: *RT, ref: u32) *ObjectKind {
-        std.debug.assert(ref < rt.kinds.items.len);
-        return &rt.kinds.items[ref];
-    }
-
-    /// add a reference to an existing object
-    fn obtain(rt: *RT, ref: Ref) void {
-        if (ref == nil) return;
-        const meta = rt.metadataPtr(ref);
-        meta.rc += 1;
-    }
-
-    /// remove a reference from an existing obj, putting it on the free list if it has no parents
-    fn release(rt: *RT, ref: Ref) void {
-        if (ref == nil) return;
-        const meta = rt.metadataPtr(ref);
-        std.debug.assert(meta.rc > 0);
-        meta.rc -= 1;
-        if (meta.rc == 0) {
-            meta.next = rt.free_list;
-            rt.free_list = ref;
-        }
-    }
-
-    fn newReal(rt: *RT, value: f64) Ref {
-        const ref = rt._new();
-        const obj = rt.objectPtr(ref);
-        obj.* = Object{ .real = value };
-        rt.kindPtr(ref).* = .real;
-        rt._hash(ref);
-        return ref;
-    }
-
-    fn newCons(rt: *RT, car: Ref, cdr: Ref) Ref {
-        const ref = rt._new();
-        const obj = rt.objectPtr(ref);
-        rt.obtain(car);
-        rt.obtain(cdr);
-        obj.* = Object{ .cons = .{ .car = car, .cdr = cdr } };
-        rt.kindPtr(ref).* = .cons;
-        rt._hash(ref);
-        return ref;
-    }
-
-    fn newHamt(rt: *RT, children: [8]Ref) Ref {
-        const ref = rt._new();
-        const obj = rt.objectPtr(ref);
-        for (0..8) |i| {
-            rt.obtain(children[i]);
-        }
-        obj.* = Object{ .hamt = .{
-            .children = children,
-        } };
-        rt.kindPtr(ref).* = .hamt;
-        rt._hash(ref);
-        return ref;
-    }
-
-    /// checks if two objects are identical by value
     fn eql(rt: *RT, aref: Ref, bref: Ref) bool {
-        // is it better to test hash first or kind first?
-        // intuition says hash, since there are more options so false equality should be more rare
-        if (aref == bref) return true;
-        if (rt.hashPtr(aref).* != rt.hashPtr(bref).*) return false;
-        if (rt.kindPtr(aref).* != rt.kindPtr(bref).*) return false;
-
-        std.debug.assert(rt.kindPtr(aref).* == rt.kindPtr(bref).*);
-        return switch (rt.kindPtr(aref).*) {
-            .real => rt.objectPtr(aref).real == rt.objectPtr(bref).real,
+        if (std.meta.eql(aref, bref)) return true;
+        if (aref.hash() != bref.hash()) return false;
+        if (aref.kind() != bref.kind()) return false;
+        return switch (aref.kind()) {
+            .real => rt.get(.real, aref) == rt.get(.real, bref),
             .cons => blk: {
-                const a = rt.objectPtr(aref).cons;
-                const b = rt.objectPtr(bref).cons;
-                break :blk rt.eql(a.car, b.car) and rt.eql(a.cdr, b.cdr);
+                const a = rt.get(.cons, aref);
+                const b = rt.get(.cons, bref);
+                break :blk rt.eql(a[0], b[0]) and rt.eql(a[1], b[1]);
             },
             .hamt => blk: {
-                const a = rt.objectPtr(aref).hamt;
-                const b = rt.objectPtr(bref).hamt;
-                for (0..8) |i| if (!rt.eql(a.children[i], b.children[i])) break :blk false;
+                const a = rt.get(.hamt, aref);
+                const b = rt.get(.hamt, bref);
+                for (a, b) |x, y| if (!rt.eql(x, y)) break :blk false;
                 break :blk true;
             },
         };
     }
 
-    fn hamtAssoc(rt: *RT, ref: Ref, keyref: Ref, valref: Ref) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        return rt._hamtAssocImpl(ref, keyref, valref, 0);
+    fn hamtAssoc(rt: *RT, hamtref: Ref, keyref: Ref, valref: Ref) Ref {
+        return rt._hamtAssocImpl(hamtref, keyref, valref, 0);
     }
-
-    fn _hamtAssocImpl(rt: *RT, ref: Ref, keyref: Ref, valref: Ref, depth: u32) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        if (depth > 9) @panic("max depth");
-
-        const walk = rt._dupNoObtain(ref);
-        const walk_ptr = rt.objectPtr(walk);
-        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
-
-        std.debug.assert(walk != ref);
-        std.debug.assert(rt.kindPtr(walk).* == .hamt);
-
-        for (0..8) |j| {
-            if (j != i) {
-                rt.obtain(walk_ptr.hamt.children[j]);
-                continue;
-            }
-
-            const child = walk_ptr.hamt.children[i];
-            if (child == nil) {
-                walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
-            } else {
-                switch (rt.kindPtr(child).*) {
-                    .cons => {
-                        const cons = rt.objectPtr(child).cons;
-                        if (rt.eql(cons.car, keyref)) {
-                            // special case where key is aready present
-                            walk_ptr.hamt.children[i] = rt.newCons(keyref, valref);
-                        } else {
-                            // make a new subtree and insert
-                            // - the thing we collided with
-                            // - the new kv pair
-                            const k = (rt.hashPtr(cons.car).* >> @intCast((depth + 1) * 3)) & 7;
-                            var contents = [_]u32{ nil, nil, nil, nil, nil, nil, nil, nil };
-                            contents[k] = child;
-                            const h1 = rt.newHamt(contents);
-                            const h2 = rt._hamtAssocImpl(h1, keyref, valref, depth + 1);
-                            rt.release(h1);
-                            walk_ptr.hamt.children[i] = h2;
-                        }
-                    },
-                    .hamt => {
-                        walk_ptr.hamt.children[i] =
-                            rt._hamtAssocImpl(child, keyref, valref, depth + 1);
-                    },
-                    else => unreachable,
-                }
+    fn _hamtAssocImpl(rt: *RT, hamtref: Ref, keyref: Ref, valref: Ref, depth: u32) Ref {
+        std.debug.assert(hamtref.kind() == .hamt);
+        if (depth >= 6) @panic("max depth"); // TODO switch to an alist at max depth
+        var node = rt.get(.hamt, hamtref); // NOTE, this is a by-value copy, not a reference
+        const i = (hamtref.hash() >> @intCast(depth * 4)) & 0b1111;
+        if (node[i].isNil()) {
+            node[i] = rt.create(.cons, .{ keyref, valref });
+        } else {
+            switch (node[i].kind()) {
+                .cons => {
+                    const cons = rt.get(.cons, node[i]);
+                    if (rt.eql(cons[0], keyref)) {
+                        // key is already present, replace val
+                        node[i] = rt.create(.cons, .{ keyref, valref });
+                    } else {
+                        const k = (cons[0].hash() >> @intCast((depth + 1) * 3)) & 0b1111;
+                        var contents = [_]Ref{nil} ** 16;
+                        contents[k] = node[i];
+                        const h = rt.create(.hamt, contents);
+                        node[i] = rt._hamtAssocImpl(h, keyref, valref, depth + 1);
+                    }
+                },
+                .hamt => return rt._hamtAssocImpl(node[i], keyref, valref, depth + 1),
+                else => unreachable,
             }
         }
-
-        rt._hash(walk);
-        return walk;
+        return rt.create(.hamt, node);
     }
 
-    fn hamtContains(rt: *RT, ref: Ref, keyref: Ref) bool {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        return rt._hamtContainsImpl(ref, keyref, 0);
+    fn hamtContains(rt: *RT, hamtref: Ref, keyref: Ref) bool {
+        return rt._hamtContainsImpl(hamtref, keyref, 0);
     }
-
-    fn _hamtContainsImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) bool {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        if (depth > 9) @panic("max depth");
-
-        const hamt = rt.objectPtr(ref).hamt;
-        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
-        const child = hamt.children[i];
-        if (child == nil) return false;
-        return switch (rt.kindPtr(child).*) {
+    fn _hamtContainsImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) bool {
+        std.debug.assert(hamtref.kind() == .hamt);
+        if (depth >= 6) @panic("max depth"); // TODO switch to an alist at max depth
+        var node = rt.get(.hamt, hamtref);
+        const i = (hamtref.hash() >> @intCast(depth * 4)) & 0b1111;
+        if (node[i].isNil()) return false;
+        return switch (node[i].kind()) {
             .cons => blk: {
-                const cons = rt.objectPtr(child).cons;
-                break :blk rt.eql(cons.car, keyref);
+                const cons = rt.get(.cons, node[i]);
+                break :blk rt.eql(cons[0], keyref);
             },
-            .hamt => _hamtContainsImpl(rt, child, keyref, depth + 1),
+            .hamt => rt._hamtContainsImpl(hamtref, keyref, depth + 1),
             else => unreachable,
         };
     }
 
-    fn hamtGet(rt: *RT, ref: Ref, keyref: Ref) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        return rt._hamtGetImpl(ref, keyref, 0);
+    fn hamtGet(rt: *RT, hamtref: Ref, keyref: Ref) Ref {
+        return rt._hamtGetImpl(hamtref, keyref, 0);
     }
-
-    fn _hamtGetImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        if (depth > 9) @panic("max depth");
-
-        const hamt = rt.objectPtr(ref).hamt;
-        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
-        const child = hamt.children[i];
-        if (child == nil) return nil;
-        return switch (rt.kindPtr(child).*) {
+    fn _hamtGetImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) bool {
+        std.debug.assert(hamtref.kind() == .hamt);
+        if (depth >= 6) @panic("max depth"); // TODO switch to an alist at max depth
+        var node = rt.get(.hamt, hamtref);
+        const i = (hamtref.hash() >> @intCast(depth * 4)) & 0b1111;
+        if (node[i].isNil()) return nil;
+        return switch (node[i].kind()) {
             .cons => blk: {
-                const cons = rt.objectPtr(child).cons;
-                break :blk if (rt.eql(cons.car, keyref))
-                    cons.cdr
-                else
-                    nil;
+                const cons = rt.get(.cons, node[i]);
+                break :blk if (rt.eql(cons[0], keyref)) cons[1] else nil;
             },
-            .hamt => _hamtGetImpl(rt, child, keyref, depth + 1),
+            .hamt => rt._hamtGetImpl(hamtref, keyref, depth + 1),
             else => unreachable,
         };
     }
 
-    fn hamtDissoc(rt: *RT, ref: Ref, keyref: Ref) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        const result = rt._hamtDissocImpl(ref, keyref, 0);
-        if (result == ref) rt.obtain(result); // key not found, return the same map so increase rc
-        return result;
+    fn hamtDissoc(rt: *RT, hamtref: Ref, keyref: Ref) Ref {
+        return rt._hamtDissocImpl(hamtref, keyref, 0);
     }
-
-    fn _hamtDissocImpl(rt: *RT, ref: Ref, keyref: Ref, depth: u32) Ref {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        if (depth > 9) @panic("max depth");
-
-        const hamt = rt.objectPtr(ref).hamt;
-        const i = (rt.hashPtr(keyref).* >> @intCast(depth * 3)) & 0b111;
-        const child = hamt.children[i];
-        if (child == nil) return ref;
-        switch (rt.kindPtr(child).*) {
+    fn _hamtDissocImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) Ref {
+        std.debug.assert(hamtref.kind() == .hamt);
+        if (depth >= 6) @panic("max depth"); // TODO switch to an alist at max depth
+        var node = rt.get(.hamt, hamtref);
+        const i = (hamtref.hash() >> @intCast(depth * 4)) & 0b1111;
+        if (node[i].isNil()) return hamtref;
+        switch (node[i].kind()) {
             .cons => {
-                const cons = rt.objectPtr(child).cons;
-                if (!rt.eql(cons.car, keyref)) return ref;
+                const cons = rt.get(.cons, node[i]);
+                if (!rt.eql(cons[0], keyref)) return hamtref;
 
-                // for simplicity, only delete hamt nodes when completely empty
-                // even though we could lower the tree height by removing if there is 1 child
-                // though never do this at root level, we don't want to remove the whole map
+                // if we're deleting the last child of this node, delete the whole node
                 if (depth > 0) {
                     var n: u32 = 0;
-                    for (hamt.children) |c| {
-                        if (c != nil) n += 1;
+                    for (node) |c| {
+                        if (!c.isNil()) n += 1;
                     }
                     std.debug.assert(n > 0);
                     if (n == 1) return nil;
                 }
 
-                // just delete a node
-                const walk = rt._dupNoObtain(ref);
-                const walk_ptr = rt.objectPtr(walk);
-                walk_ptr.hamt.children[i] = nil;
-                for (0..8) |j| rt.obtain(walk_ptr.hamt.children[j]);
-                rt._hash(walk);
-                return walk;
+                node[i] = nil;
+                return rt.create(.hamt, node);
             },
             .hamt => {
-                const result = rt._hamtDissocImpl(child, keyref, depth + 1);
-                if (result == child) return ref;
-                const walk = rt._dupNoObtain(ref);
-                const walk_ptr = rt.objectPtr(walk);
-                walk_ptr.hamt.children[i] = result;
-                for (0..8) |j| {
-                    if (i == j) continue;
-                    rt.obtain(walk_ptr.hamt.children[j]);
-                }
-                rt._hash(walk);
-                return walk;
+                const result = rt._hamtDissocImpl(node[i], keyref, depth + 1);
+                if (rt.eql(node[i], result)) return hamtref;
+                node[i] = result;
+                return rt.create(.hamt, node);
             },
             else => unreachable,
         }
     }
-
-    fn debugPrint(rt: *RT, ref: Ref) void {
-        if (ref == nil) {
-            std.debug.print("nil", .{});
-        } else {
-            rt._debugPrintImpl(ref);
-        }
-        std.debug.print("\n", .{});
-    }
-
-    /// actually release a value in the free_list so that the memory can be reused
-    /// called on value in free list when we try to allocate (i.e. lazy refcounting)
-    fn _releaseImpl(rt: *RT, ref: Ref) void {
-        switch (rt.kindPtr(ref).*) {
-            .real => {},
-            .cons => {
-                const cons = rt.objectPtr(ref).cons;
-                if (cons.car != nil) rt.release(cons.car);
-                if (cons.cdr != nil) rt.release(cons.cdr);
-            },
-            .hamt => {
-                const hamt = rt.objectPtr(ref).hamt;
-                for (hamt.children) |child| {
-                    if (child != nil) rt.release(child);
-                }
-            },
-        }
-    }
-
-    fn _new(rt: *RT) Ref {
-        if (rt.free_list == nil) {
-            std.debug.assert(rt.metadata.items.len == rt.objects.items.len);
-            std.debug.assert(rt.metadata.items.len == rt.hashes.items.len);
-            std.debug.assert(rt.metadata.items.len == rt.kinds.items.len);
-            const ref: Ref = @intCast(rt.objects.items.len);
-            rt.metadata.append(.{ .rc = 1 }) catch @panic("out of memory");
-            rt.objects.append(.{ .hamt = undefined }) catch @panic("out of memory");
-            rt.hashes.append(undefined) catch @panic("out of memory");
-            rt.kinds.append(undefined) catch @panic("out of memory");
-            return ref;
-        }
-
-        const ref = rt.free_list;
-        rt.free_list = rt.metadataPtr(ref).next;
-        rt._releaseImpl(ref); // lazy refcounting
-        rt.metadataPtr(ref).rc = 1;
-        return ref;
-    }
-
-    /// make a duplicate of a node, but don't increment any reference counts
-    fn _dupNoObtain(rt: *RT, ref: Ref) Ref {
-        const r = rt._new();
-        // NOTE _new already returns the correct metadata for the duplecate
-        rt.objectPtr(r).* = rt.objectPtr(ref).*;
-        rt.hashPtr(r).* = rt.hashPtr(ref).*;
-        rt.kindPtr(r).* = rt.kindPtr(ref).*;
-        return r;
-    }
-
-    fn _hash(rt: *RT, ref: Ref) void {
-        rt.hashPtr(ref).* = switch (rt.kindPtr(ref).*) {
-            .real => std.hash.XxHash32.hash(1337, std.mem.asBytes(&rt.objectPtr(ref).real)),
-            .cons => blk: {
-                const cons = rt.objectPtr(ref).cons;
-                var h: u32 = 0;
-                h ^= if (cons.car == nil) NILHASH else rt.hashPtr(cons.car).*;
-                h *%= 91;
-                h ^= if (cons.cdr == nil) NILHASH else rt.hashPtr(cons.cdr).*;
-                break :blk h;
-            },
-            .hamt => blk: {
-                const hamt = rt.objectPtr(ref).hamt;
-                var h: u32 = 0;
-                for (hamt.children) |child| {
-                    h ^= if (child == nil) NILHASH else rt.hashPtr(child).*;
-                    h *%= 89;
-                }
-                break :blk h;
-            },
-        };
-    }
-
-    fn _debugPrintImpl(rt: *RT, ref: Ref) void {
-        switch (rt.kindPtr(ref).*) {
-            .real => std.debug.print("{}", .{rt.objectPtr(ref).real}),
-            .cons => {
-                const cons = rt.objectPtr(ref).cons;
-                // TODO special case for list printing?
-                std.debug.print("(", .{});
-                if (cons.car == nil)
-                    std.debug.print("nil", .{})
-                else
-                    rt._debugPrintImpl(cons.car);
-                std.debug.print(" . ", .{});
-                if (cons.cdr == nil)
-                    std.debug.print("nil", .{})
-                else
-                    rt._debugPrintImpl(cons.cdr);
-                std.debug.print(")", .{});
-            },
-            .hamt => {
-                std.debug.print("{{", .{});
-                rt._debugPrintHamtImpl(ref);
-                std.debug.print("}}", .{});
-            },
-        }
-    }
-
-    fn _debugPrintHamtImpl(rt: *RT, ref: Ref) void {
-        std.debug.assert(rt.kindPtr(ref).* == .hamt);
-        const hamt = rt.objectPtr(ref).hamt;
-
-        for (hamt.children) |child| {
-            if (child == nil) {
-                // std.debug.print(", ", .{});
-                continue;
-            }
-            switch (rt.kindPtr(child).*) {
-                .cons => {
-                    const cons = rt.objectPtr(child).cons;
-                    // NOTE hashmaps can overflow (TODO replace with a list if at max depth)
-                    if (cons.car == nil)
-                        std.debug.print("nil", .{})
-                    else
-                        rt._debugPrintImpl(cons.car);
-                    std.debug.print(" ", .{});
-                    if (cons.cdr == nil)
-                        std.debug.print("nil", .{})
-                    else
-                        rt._debugPrintImpl(cons.cdr);
-                },
-                .hamt => {
-                    rt._debugPrintHamtImpl(child);
-                },
-                else => unreachable,
-            }
-            std.debug.print(" ", .{});
-        }
-    }
 };
 
-pub fn main() !void {
-    try scratch();
-    try benchmark();
-    try benchmarkReference();
-    try fuzz();
-}
-
-fn fuzz() !void {
+fn benchmark() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
+    var timer = try std.time.Timer.start();
 
     const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
     const m = 30000;
+    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
 
     for (ns) |n| {
-        var rt = RT.init(alloc);
+        var rt = try RT.init(alloc);
         defer rt.deinit();
 
-        var h = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
-        var s = std.AutoHashMap(u32, u32).init(alloc);
-        defer s.deinit();
+        timer.reset();
+        var h = rt.create(
+            .hamt,
+            .{ nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil },
+        );
 
-        for (0..m) |_| {
-            const x = rand.intRangeLessThan(u32, 0, n);
-            const y = rand.intRangeLessThan(u32, 0, n);
-            const a = rt.newReal(@floatFromInt(x));
-            const b = rt.newReal(@floatFromInt(y));
+        var n_assoc: u32 = 0;
+        var n_dissoc: u32 = 0;
 
-            std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
+        for (0..m) |k| {
+            const a = rt.create(.real, @floatFromInt(rand.intRangeLessThan(u32, 0, n)));
+            const b = rt.create(.real, @floatFromInt(rand.intRangeLessThan(u32, 0, n)));
+
             if (rt.hamtContains(h, a)) {
-                std.debug.assert(
-                    @as(u32, @intFromFloat(rt.objectPtr(rt.hamtGet(h, a)).real)) == s.get(x).?,
-                );
                 const h2 = rt.hamtDissoc(h, a);
-                rt.release(h);
                 h = h2;
-                _ = s.remove(x);
+                n_dissoc += 1;
             } else {
                 const h2 = rt.hamtAssoc(h, a, b);
-                rt.release(h);
                 h = h2;
-                try s.put(x, y);
+                n_assoc += 1;
             }
 
-            rt.release(a);
-            rt.release(b);
+            if (k % 1000 == 0) {
+                rt.gc.trace(h);
+                rt.gc.sweep();
+                rt.gc.compact();
+            }
         }
 
-        rt.release(h);
+        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
     }
 }
 
@@ -547,148 +254,5 @@ fn benchmarkReference() !void {
             }
         }
         std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
-    }
-}
-
-fn benchmark() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
-    var rand = rng.random();
-    var timer = try std.time.Timer.start();
-
-    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
-    const m = 30000;
-    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
-
-    for (ns) |n| {
-        var rt = RT.init(alloc);
-        defer rt.deinit();
-
-        timer.reset();
-        var h = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
-
-        var n_assoc: u32 = 0;
-        var n_dissoc: u32 = 0;
-
-        for (0..m) |_| {
-            const a = rt.newReal(@floatFromInt(rand.intRangeLessThan(u32, 0, n)));
-            const b = rt.newReal(@floatFromInt(rand.intRangeLessThan(u32, 0, n)));
-
-            if (rt.hamtContains(h, a)) {
-                const h2 = rt.hamtDissoc(h, a);
-                rt.release(h);
-                h = h2;
-                n_dissoc += 1;
-            } else {
-                const h2 = rt.hamtAssoc(h, a, b);
-                rt.release(h);
-                h = h2;
-                n_assoc += 1;
-            }
-
-            rt.release(a);
-            rt.release(b);
-        }
-
-        rt.release(h);
-        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
-    }
-}
-
-fn scratch() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-
-    var rt = RT.init(alloc);
-    defer rt.deinit();
-
-    const a = rt.newReal(1.0);
-    const b = rt.newReal(2.0);
-    const c = rt.newCons(a, b);
-    const d = rt.newHamt(.{ nil, nil, nil, nil, nil, nil, nil, nil });
-    const e = rt.hamtAssoc(d, a, b);
-    const f = rt.hamtAssoc(e, b, c);
-    const g = rt.hamtAssoc(f, c, a);
-    const h = rt.hamtDissoc(g, a);
-    const i = rt.hamtDissoc(h, b);
-    const j = rt.hamtDissoc(i, c);
-    const k = rt.hamtAssoc(g, c, b);
-
-    rt.debugPrint(a);
-    rt.debugPrint(b);
-    rt.debugPrint(c);
-    rt.debugPrint(d);
-    rt.debugPrint(e);
-    rt.debugPrint(f);
-    rt.debugPrint(g);
-    rt.debugPrint(h);
-    rt.debugPrint(i);
-    rt.debugPrint(j);
-    rt.debugPrint(k);
-
-    std.debug.print("{}\n", .{rt.hamtContains(g, a)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, b)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, c)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, d)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, e)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, f)});
-    std.debug.print("{}\n", .{rt.hamtContains(g, g)});
-
-    rt.debugPrint(rt.hamtGet(g, a));
-    rt.debugPrint(rt.hamtGet(g, b));
-    rt.debugPrint(rt.hamtGet(g, c));
-    rt.debugPrint(rt.hamtGet(g, d));
-    rt.debugPrint(rt.hamtGet(g, e));
-    rt.debugPrint(rt.hamtGet(g, f));
-    rt.debugPrint(rt.hamtGet(g, g));
-
-    std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
-        switch (kind) {
-            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
-            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
-            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
-        }
-    }
-
-    while (rt.free_list != nil) {
-        _ = rt.newReal(0.0);
-    }
-    _ = rt.newReal(0.0);
-
-    std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
-        switch (kind) {
-            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
-            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
-            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
-        }
-    }
-
-    rt.release(a);
-    rt.release(b);
-    rt.release(c);
-    rt.release(d);
-    rt.release(e);
-    rt.release(f);
-    rt.release(g);
-    rt.release(h);
-    rt.release(i);
-    rt.release(j);
-    rt.release(k);
-
-    while (rt.free_list != nil) {
-        _ = rt.newReal(0.0);
-    }
-    _ = rt.newReal(0.0);
-
-    std.debug.print("--- object breakdown ---\n", .{});
-    for (rt.objects.items, rt.kinds.items, rt.metadata.items, 0..) |obj, kind, meta, z| {
-        switch (kind) {
-            .real => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.real }),
-            .cons => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.cons }),
-            .hamt => std.debug.print("{:>3} {:>3} {}\n", .{ z, meta.rc, obj.hamt }),
-        }
     }
 }
