@@ -222,14 +222,6 @@ fn SingularGCType(comptime kind: Kind) type {
         }
 
         fn sweep(sgc: *SGC) void {
-            std.debug.print("{}\t[ ", .{kind});
-            var walk = sgc.free_list;
-            while (walk != std.math.maxInt(usize)) {
-                std.debug.print("{} ", .{walk});
-                walk = sgc.page_table.items(.page)[walk];
-            }
-            std.debug.print("]\n", .{});
-
             // NOTE we only sweep the inactive pages
             // remove all values that haven't been marked
             for (sgc.inactive_pages.items) |page| {
@@ -306,7 +298,6 @@ fn SingularGCType(comptime kind: Kind) type {
                         sgc.pairing_buffer.items[j],
                     )) continue;
                     mergeInto(sgc.pairing_buffer.items[i], sgc.pairing_buffer.items[j]);
-                    std.debug.print("MERGE!\n", .{});
                     // redirect all entries pointing to the page we just merged
                     for (sgc.page_table.items(.page), sgc.page_table.items(.free)) |*pt, free| {
                         if (free) continue;
