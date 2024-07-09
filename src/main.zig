@@ -22,18 +22,6 @@ const RT = struct {
         return rt.gc.create(kind, val) catch @panic("GC allocation failure");
     }
 
-    // fn dup(rt: *RT, comptime kind: _gc.Kind, ref: *Ref) !Ref {
-    //     return rt.create(kind, rt.get(kind, ref));
-    // }
-
-    // fn dupUnk(rt: *RT, ref: *Ref) !Ref {
-    //     return switch (ref.kind()) {
-    //         .real => rt.dup(.real, ref),
-    //         .cons => rt.dup(.cons, ref),
-    //         .hamt => rt.dup(.hamt, ref),
-    //     };
-    // }
-
     fn get(rt: *RT, comptime kind: _gc.Kind, ref: Ref) _gc.KindType(kind) {
         return rt.gc.get(kind, ref);
     }
@@ -203,6 +191,14 @@ const RT = struct {
             }
         } else {
             node[i] = rt._alistDissoc(node[i], keyref);
+            // if we emptied the alist and this node is otherwise empty, delete the node
+            if (depth > 0) {
+                var n: u32 = 0;
+                for (node) |c| {
+                    if (!c.isNil()) n += 1;
+                }
+                if (n == 0) return nil;
+            }
         }
         return rt.create(.hamt, node);
     }
@@ -285,8 +281,8 @@ const RT = struct {
 };
 
 pub fn main() !void {
-    try scratch();
-    try fuzz();
+    // try scratch();
+    // try fuzz();
     try benchmark();
     try benchmarkReference();
 }
@@ -317,7 +313,7 @@ fn fuzz() !void {
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
 
-    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192, 16384 };
     const m = 30000;
 
     for (ns) |n| {
@@ -338,6 +334,7 @@ fn fuzz() !void {
             const a = rt.create(.real, @floatFromInt(x));
             const b = rt.create(.real, @floatFromInt(y));
 
+            std.debug.print("{} {}\n", .{ rt.hamtContains(h, a), s.contains(x) });
             std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             if (rt.hamtContains(h, a)) {
                 std.debug.assert(
@@ -346,10 +343,14 @@ fn fuzz() !void {
                 const h2 = rt.hamtDissoc(h, a);
                 h = h2;
                 _ = s.remove(x);
+                std.debug.assert(!rt.hamtContains(h, a));
+                std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             } else {
                 const h2 = rt.hamtAssoc(h, a, b);
                 h = h2;
                 try s.put(x, y);
+                std.debug.assert(rt.hamtContains(h, a));
+                std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             }
         }
     }
@@ -362,7 +363,7 @@ fn benchmark() !void {
     var rand = rng.random();
     var timer = try std.time.Timer.start();
 
-    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192 };
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192, 16384 };
     const m = 30000;
     std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
 
@@ -396,6 +397,7 @@ fn benchmark() !void {
                 n_assoc += 1;
             }
 
+            // _ = k;
             if (k % 1000 == 0) {
                 rt.gc.trace(h);
                 rt.gc.sweep();
@@ -416,7 +418,7 @@ fn benchmarkReference() !void {
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
     var timer = try std.time.Timer.start();
-    const ns = [_]u32{ 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+    const ns = [_]u32{ 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 };
     const m = 30000;
     std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
 

@@ -80,19 +80,19 @@ fn SingularGCType(comptime kind: Kind) type {
         marks: std.StaticBitSet(N),
         used: std.StaticBitSet(N),
 
-        pub fn create(alloc: std.mem.Allocator) !*@This() {
-            var page = try alloc.create(@This());
+        pub fn create(pool: *std.heap.MemoryPool(@This())) !*@This() {
+            var page = try pool.create();
             page.len = 0;
             page.used = std.StaticBitSet(N).initEmpty();
             return page;
         }
 
-        fn destroy(page: *@This(), alloc: std.mem.Allocator) void {
+        fn destroy(page: *@This(), pool: *std.heap.MemoryPool(@This())) void {
             var it = page.used.iterator(.{});
             while (it.next()) |i| {
                 finalize(kind, page.data[i]);
             }
-            alloc.destroy(page);
+            pool.destroy(page);
         }
     };
 
@@ -117,27 +117,40 @@ fn SingularGCType(comptime kind: Kind) type {
         page_table: std.MultiArrayList(TableEntry),
         free_list: usize,
 
+        page_arena: *std.heap.ArenaAllocator,
+        page_pool: *std.heap.MemoryPool(Page),
+
         fn init(alloc: std.mem.Allocator, rand: std.Random.Random) !SGC {
             var sgc = SGC{
                 .alloc = alloc,
                 .rand = rand,
                 .shuffle = undefined,
                 .active_page = undefined,
-                .inactive_pages = std.ArrayList(*Page).init(alloc),
-                .pairing_buffer = std.ArrayList(*Page).init(alloc),
+                .inactive_pages = try std.ArrayList(*Page).initCapacity(alloc, 1024),
+                .pairing_buffer = try std.ArrayList(*Page).initCapacity(alloc, 1024),
                 .page_table = std.MultiArrayList(TableEntry){},
                 .free_list = std.math.maxInt(usize),
+                .page_arena = undefined,
+                .page_pool = undefined,
             };
+            try sgc.page_table.ensureTotalCapacity(alloc, 1024 * 1024);
+            sgc.page_arena = try alloc.create(std.heap.ArenaAllocator);
+            sgc.page_arena.* = std.heap.ArenaAllocator.init(alloc);
+            errdefer sgc.page_arena.deinit();
+            const aa = sgc.page_arena.allocator();
+            sgc.page_pool = try aa.create(std.heap.MemoryPool(Page));
+            sgc.page_pool.* = try std.heap.MemoryPool(Page).initPreheated(aa, 1024);
             try sgc.newActivePage(true);
             return sgc;
         }
 
         fn deinit(sgc: *SGC) void {
-            sgc.active_page.destroy(sgc.alloc);
-            for (sgc.inactive_pages.items) |page| page.destroy(sgc.alloc);
+            sgc.active_page.destroy(sgc.page_pool);
+            for (sgc.inactive_pages.items) |page| page.destroy(sgc.page_pool);
             sgc.inactive_pages.deinit();
             sgc.pairing_buffer.deinit();
             sgc.page_table.deinit(sgc.alloc);
+            sgc.page_arena.deinit();
             sgc.* = undefined;
         }
 
@@ -150,7 +163,7 @@ fn SingularGCType(comptime kind: Kind) type {
             if (sgc.free_list == std.math.maxInt(usize)) {
                 try sgc.page_table.ensureUnusedCapacity(sgc.alloc, 1);
             }
-            const new_page = try Page.create(sgc.alloc);
+            const new_page = try Page.create(sgc.page_pool);
             if (!first_time) {
                 sgc.inactive_pages.appendAssumeCapacity(sgc.active_page);
             }
@@ -310,7 +323,8 @@ fn SingularGCType(comptime kind: Kind) type {
                     while (sgc.inactive_pages.items[ixd] != sgc.pairing_buffer.items[i]) {
                         ixd += 1;
                     }
-                    sgc.alloc.destroy(sgc.inactive_pages.swapRemove(ixd));
+                    // note we intentionally don't finalize, the objects were moved out
+                    sgc.page_pool.destroy(sgc.inactive_pages.swapRemove(ixd));
                     // and drop it from considereation in future merges
                     _ = sgc.pairing_buffer.swapRemove(i);
                 }
@@ -378,12 +392,15 @@ pub const GC = struct {
     }
 
     pub fn create(gc: *GC, comptime kind: Kind, val: KindType(kind)) !Ref {
+        // NOTE we want hamts with the same set of key-value pairs to hash the same
+        // even if the tree structure is not the same
+        // and since the hamt contains an alist after a certain depth,
+        // alists also have to hash the same irrespective of order
         const hash = switch (kind) {
             .real => std.hash.XxHash32.hash(2590326161, std.mem.asBytes(&val)),
             .cons => blk: {
                 var h: u32 = 0;
                 h ^= if (val[0].isNil()) NILHASH else val[0].hash();
-                h *%= 3425487983; // does this lose 1/4 of the randomness of the car?
                 h ^= if (val[0].isNil()) NILHASH else val[1].hash();
                 break :blk h;
             },
@@ -391,7 +408,6 @@ pub const GC = struct {
                 var h: u32 = 0;
                 for (val) |child| {
                     h ^= if (child.isNil()) NILHASH else child.hash();
-                    h *%= 3680932543; // same question, do we lose entropy in the early hashes?
                 }
                 break :blk h;
             },
