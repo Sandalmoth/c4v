@@ -79,7 +79,14 @@ const RT = struct {
                             // slot is already occupied, create new level of hamt
                             const k = (cons[0].hash() >> @intCast((depth + 1) * 4)) & 0b1111;
                             var contents = [_]Ref{nil} ** 16;
-                            contents[k] = node[i];
+                            // NOTE since we're creating a next level,
+                            // we need to take into consideration that that level could be a leaf
+                            // and if so use an alist instead of a direct cons
+                            if (depth < 4) {
+                                contents[k] = node[i];
+                            } else {
+                                contents[k] = rt.create(.cons, .{ node[i], nil });
+                            }
                             const h = rt.create(.hamt, contents);
                             node[i] = rt._hamtAssocImpl(h, keyref, valref, depth + 1);
                         }
@@ -278,10 +285,30 @@ const RT = struct {
 };
 
 pub fn main() !void {
-    // try scratch();
+    try scratch();
     try fuzz();
     try benchmark();
     try benchmarkReference();
+}
+
+fn scratch() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+    var rt = try RT.init(alloc);
+    defer rt.deinit();
+
+    const h0 = rt.create(.hamt, [_]Ref{nil} ** 16);
+    rt.debugPrint(h0);
+
+    const h1a = rt.hamtAssoc(h0, rt.create(.real, 55.0), rt.create(.real, 1.0));
+    rt.debugPrint(h1a);
+    const h1b = rt.hamtAssoc(h0, rt.create(.real, 1843.0), rt.create(.real, 1.0));
+    rt.debugPrint(h1b);
+
+    const h2a = rt.hamtAssoc(h1a, rt.create(.real, 1843.0), rt.create(.real, 2.0));
+    rt.debugPrint(h2a);
+    const h2b = rt.hamtAssoc(h1b, rt.create(.real, 55.0), rt.create(.real, 2.0));
+    rt.debugPrint(h2b);
 }
 
 fn fuzz() !void {
