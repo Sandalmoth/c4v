@@ -15,7 +15,7 @@ pub fn ValueType(comptime kind: Kind) type {
     return switch (kind) {
         .real => f64,
         .cons => [2]?*Object,
-        .hamt => [4]?*Object,
+        .hamt => [16]?*Object,
         .string => []const u8,
     };
 }

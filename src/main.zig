@@ -51,8 +51,8 @@ const RT = struct {
     fn _hamtAssocImpl(rt: *RT, hamtref: *Object, keyref: *Object, valref: *Object, depth: u32) *Object {
         std.debug.assert(hamtref.kind == .hamt);
         var node = hamtref.value(.hamt); // NOTE, this is a by-value copy, not a reference
-        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
-        if (depth < 11) {
+        const i = (keyref.hash >> @intCast(depth * 4)) & 0b1111;
+        if (depth < 7) {
             if (node[i] == null) {
                 node[i] = rt.create(.cons, .{ keyref, valref });
             } else {
@@ -64,12 +64,12 @@ const RT = struct {
                             node[i] = rt.create(.cons, .{ keyref, valref });
                         } else {
                             // slot is already occupied, create new level of hamt
-                            const k = (cons[0].?.hash >> @intCast((depth + 1) * 2)) & 0b11;
-                            var contents = [_]?*Object{null} ** 4;
+                            const k = (cons[0].?.hash >> @intCast((depth + 1) * 4)) & 0b1111;
+                            var contents = [_]?*Object{null} ** 16;
                             // NOTE since we're creating a next level,
                             // we need to take into consideration that that level could be a leaf
                             // and if so use an alist instead of a direct cons
-                            if (depth < 10) {
+                            if (depth < 6) {
                                 contents[k] = node[i];
                             } else {
                                 contents[k] = rt.create(.cons, .{ node[i], null });
@@ -103,9 +103,9 @@ const RT = struct {
     fn _hamtContainsImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) bool {
         std.debug.assert(hamtref.kind == .hamt);
         var node = hamtref.value(.hamt);
-        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        const i = (keyref.hash >> @intCast(depth * 4)) & 0b1111;
         if (node[i] == null) return false;
-        if (depth < 11) {
+        if (depth < 7) {
             return switch (node[i].?.kind) {
                 .cons => blk: {
                     const cons = node[i].?.value(.cons);
@@ -131,9 +131,9 @@ const RT = struct {
     fn _hamtGetImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) ?*Object {
         std.debug.assert(hamtref.kind == .hamt);
         var node = hamtref.value(.hamt);
-        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        const i = (keyref.hash >> @intCast(depth * 4)) & 0b1111;
         if (node[i] == null) return null;
-        if (depth < 11) {
+        if (depth < 7) {
             return switch (node[i].?.kind) {
                 .cons => blk: {
                     const cons = node[i].?.value(.cons);
@@ -160,9 +160,9 @@ const RT = struct {
     fn _hamtDissocImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) ?*Object {
         std.debug.assert(hamtref.kind == .hamt);
         var node = hamtref.value(.hamt);
-        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        const i = (keyref.hash >> @intCast(depth * 4)) & 0b1111;
         if (node[i] == null) return hamtref;
-        if (depth < 11) {
+        if (depth < 7) {
             switch (node[i].?.kind) {
                 .cons => {
                     const cons = node[i].?.value(.cons);
@@ -394,7 +394,7 @@ fn fuzz() !void {
 
         var h = rt.create(
             .hamt,
-            [_]?*Object{null} ** 4,
+            [_]?*Object{null} ** 16,
         );
         var s = std.AutoHashMap(u32, u32).init(alloc);
         defer s.deinit();
@@ -447,7 +447,7 @@ fn benchmark() !void {
         timer.reset();
         var h = rt.create(
             .hamt,
-            [_]?*Object{null} ** 4,
+            [_]?*Object{null} ** 16,
         );
 
         var n_assoc: u32 = 0;
