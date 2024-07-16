@@ -1,15 +1,15 @@
 const std = @import("std");
+const BlockPool = @import("blockpool.zig").BlockPool(.{});
 
-const _gc = @import("gc.zig");
-const Ref = _gc.Ref;
-const nil = _gc.nil;
+const _gc = @import("gc6.zig");
+const Object = _gc.Object;
 
 const RT = struct {
     gc: _gc.GC,
 
-    fn init(alloc: std.mem.Allocator) !RT {
+    fn init(pool: *BlockPool) !RT {
         return .{
-            .gc = try _gc.GC.init(alloc),
+            .gc = try _gc.GC.init(pool),
         };
     }
 
@@ -18,223 +18,221 @@ const RT = struct {
         rt.* = undefined;
     }
 
-    fn create(rt: *RT, comptime kind: _gc.Kind, val: _gc.KindType(kind)) Ref {
+    fn create(rt: *RT, comptime kind: _gc.Kind, val: _gc.ValueType(kind)) *Object {
         return rt.gc.create(kind, val) catch @panic("GC allocation failure");
     }
 
-    fn get(rt: *RT, comptime kind: _gc.Kind, ref: Ref) _gc.KindType(kind) {
-        return rt.gc.get(kind, ref);
-    }
-
-    fn eql(rt: *RT, aref: Ref, bref: Ref) bool {
-        if (std.meta.eql(aref, bref)) return true;
-        if (aref.hash() != bref.hash()) return false;
-        if (aref.kind() != bref.kind()) return false;
-        return switch (aref.kind()) {
-            .real => rt.get(.real, aref) == rt.get(.real, bref),
+    fn eql(rt: *RT, aref: ?*Object, bref: ?*Object) bool {
+        if (aref == bref) return true;
+        if (aref == null or bref == null) return false;
+        if (aref.?.hash != bref.?.hash) return false;
+        if (aref.?.kind != bref.?.kind) return false;
+        return switch (aref.?.kind) {
+            .real => aref.?.value(.real) == bref.?.value(.real),
             .cons => blk: {
-                const a = rt.get(.cons, aref);
-                const b = rt.get(.cons, bref);
+                const a = aref.?.value(.cons);
+                const b = bref.?.value(.cons);
                 break :blk rt.eql(a[0], b[0]) and rt.eql(a[1], b[1]);
             },
             .hamt => blk: {
-                const a = rt.get(.hamt, aref);
-                const b = rt.get(.hamt, bref);
+                const a = aref.?.value(.hamt);
+                const b = bref.?.value(.hamt);
+                // FIXME this won't correctly equate hamt's with differently ordered alist leaves
                 for (a, b) |x, y| if (!rt.eql(x, y)) break :blk false;
                 break :blk true;
             },
+            .string => std.mem.eql(u8, aref.?.value(.string), bref.?.value(.string)),
         };
     }
 
-    fn hamtAssoc(rt: *RT, hamtref: Ref, keyref: Ref, valref: Ref) Ref {
+    fn hamtAssoc(rt: *RT, hamtref: *Object, keyref: *Object, valref: *Object) *Object {
         return rt._hamtAssocImpl(hamtref, keyref, valref, 0);
     }
-    fn _hamtAssocImpl(rt: *RT, hamtref: Ref, keyref: Ref, valref: Ref, depth: u32) Ref {
-        std.debug.assert(hamtref.kind() == .hamt);
-        var node = rt.get(.hamt, hamtref); // NOTE, this is a by-value copy, not a reference
-        const i = (keyref.hash() >> @intCast(depth * 4)) & 0b1111;
-        if (depth < 5) {
-            if (node[i].isNil()) {
+    fn _hamtAssocImpl(rt: *RT, hamtref: *Object, keyref: *Object, valref: *Object, depth: u32) *Object {
+        std.debug.assert(hamtref.kind == .hamt);
+        var node = hamtref.value(.hamt); // NOTE, this is a by-value copy, not a reference
+        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        if (depth < 11) {
+            if (node[i] == null) {
                 node[i] = rt.create(.cons, .{ keyref, valref });
             } else {
-                switch (node[i].kind()) {
+                switch (node[i].?.kind) {
                     .cons => {
-                        const cons = rt.get(.cons, node[i]);
+                        const cons = node[i].?.value(.cons);
                         if (rt.eql(cons[0], keyref)) {
                             // key is already present, replace val
                             node[i] = rt.create(.cons, .{ keyref, valref });
                         } else {
                             // slot is already occupied, create new level of hamt
-                            const k = (cons[0].hash() >> @intCast((depth + 1) * 4)) & 0b1111;
-                            var contents = [_]Ref{nil} ** 16;
+                            const k = (cons[0].?.hash >> @intCast((depth + 1) * 2)) & 0b11;
+                            var contents = [_]?*Object{null} ** 4;
                             // NOTE since we're creating a next level,
                             // we need to take into consideration that that level could be a leaf
                             // and if so use an alist instead of a direct cons
-                            if (depth < 4) {
+                            if (depth < 10) {
                                 contents[k] = node[i];
                             } else {
-                                contents[k] = rt.create(.cons, .{ node[i], nil });
+                                contents[k] = rt.create(.cons, .{ node[i], null });
                             }
                             const h = rt.create(.hamt, contents);
                             node[i] = rt._hamtAssocImpl(h, keyref, valref, depth + 1);
                         }
                     },
-                    .hamt => node[i] = rt._hamtAssocImpl(node[i], keyref, valref, depth + 1),
+                    .hamt => node[i] = rt._hamtAssocImpl(node[i].?, keyref, valref, depth + 1),
                     else => unreachable,
                 }
             }
         } else {
             // we've reached the leaf level alist
-            if (node[i].isNil()) {
-                node[i] = rt.create(.cons, .{ rt.create(.cons, .{ keyref, valref }), nil });
+            if (node[i] == null) {
+                node[i] = rt.create(.cons, .{ rt.create(.cons, .{ keyref, valref }), null });
             } else {
-                std.debug.assert(node[i].kind() == .cons);
+                std.debug.assert(node[i].?.kind == .cons);
                 // first delete our key from the alist (noop-ish if not present)
                 // then we can just add it
-                const alist = rt._alistDissoc(node[i], keyref);
+                const alist = rt._alistDissoc(node[i].?, keyref);
                 node[i] = rt.create(.cons, .{ rt.create(.cons, .{ keyref, valref }), alist });
             }
         }
         return rt.create(.hamt, node);
     }
 
-    fn hamtContains(rt: *RT, hamtref: Ref, keyref: Ref) bool {
+    fn hamtContains(rt: *RT, hamtref: *Object, keyref: *Object) bool {
         return rt._hamtContainsImpl(hamtref, keyref, 0);
     }
-    fn _hamtContainsImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) bool {
-        std.debug.assert(hamtref.kind() == .hamt);
-        var node = rt.get(.hamt, hamtref);
-        const i = (keyref.hash() >> @intCast(depth * 4)) & 0b1111;
-        if (node[i].isNil()) return false;
-        if (depth < 5) {
-            return switch (node[i].kind()) {
+    fn _hamtContainsImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) bool {
+        std.debug.assert(hamtref.kind == .hamt);
+        var node = hamtref.value(.hamt);
+        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        if (node[i] == null) return false;
+        if (depth < 11) {
+            return switch (node[i].?.kind) {
                 .cons => blk: {
-                    const cons = rt.get(.cons, node[i]);
+                    const cons = node[i].?.value(.cons);
                     break :blk rt.eql(cons[0], keyref);
                 },
-                .hamt => rt._hamtContainsImpl(node[i], keyref, depth + 1),
+                .hamt => rt._hamtContainsImpl(node[i].?, keyref, depth + 1),
                 else => unreachable,
             };
         } else {
-            std.debug.assert(node[i].kind() == .cons);
-            var walk = rt.get(.cons, node[i]);
+            std.debug.assert(node[i].?.kind == .cons);
+            var walk = node[i].?.value(.cons);
             while (true) {
-                if (rt.eql(rt.get(.cons, walk[0])[0], keyref)) return true;
-                if (walk[1].isNil()) return false;
-                walk = rt.get(.cons, walk[1]);
+                if (rt.eql(walk[0].?.value(.cons)[0], keyref)) return true;
+                if (walk[1] == null) return false;
+                walk = walk[1].?.value(.cons);
             }
         }
     }
 
-    fn hamtGet(rt: *RT, hamtref: Ref, keyref: Ref) Ref {
+    fn hamtGet(rt: *RT, hamtref: *Object, keyref: *Object) ?*Object {
         return rt._hamtGetImpl(hamtref, keyref, 0);
     }
-    fn _hamtGetImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) Ref {
-        std.debug.assert(hamtref.kind() == .hamt);
-        var node = rt.get(.hamt, hamtref);
-        const i = (keyref.hash() >> @intCast(depth * 4)) & 0b1111;
-        if (node[i].isNil()) return nil;
-        if (depth < 5) {
-            return switch (node[i].kind()) {
+    fn _hamtGetImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) ?*Object {
+        std.debug.assert(hamtref.kind == .hamt);
+        var node = hamtref.value(.hamt);
+        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        if (node[i] == null) return null;
+        if (depth < 11) {
+            return switch (node[i].?.kind) {
                 .cons => blk: {
-                    const cons = rt.get(.cons, node[i]);
-                    break :blk if (rt.eql(cons[0], keyref)) cons[1] else nil;
+                    const cons = node[i].?.value(.cons);
+                    break :blk if (rt.eql(cons[0], keyref)) cons[1] else null;
                 },
-                .hamt => rt._hamtGetImpl(node[i], keyref, depth + 1),
+                .hamt => rt._hamtGetImpl(node[i].?, keyref, depth + 1),
                 else => unreachable,
             };
         } else {
-            std.debug.assert(node[i].kind() == .cons);
-            var walk = rt.get(.cons, node[i]);
+            std.debug.assert(node[i].?.kind == .cons);
+            var walk = node[i].?.value(.cons);
             while (true) {
-                const a = rt.get(.cons, walk[0]);
+                const a = walk[0].?.value(.cons);
                 if (rt.eql(a[0], keyref)) return a[1];
-                if (walk[1].isNil()) return nil;
-                walk = rt.get(.cons, walk[1]);
+                if (walk[1] == null) return null;
+                walk = walk[1].?.value(.cons);
             }
         }
     }
 
-    fn hamtDissoc(rt: *RT, hamtref: Ref, keyref: Ref) Ref {
+    fn hamtDissoc(rt: *RT, hamtref: *Object, keyref: *Object) ?*Object {
         return rt._hamtDissocImpl(hamtref, keyref, 0);
     }
-    fn _hamtDissocImpl(rt: *RT, hamtref: Ref, keyref: Ref, depth: u32) Ref {
-        std.debug.assert(hamtref.kind() == .hamt);
-        if (depth >= 6) @panic("max depth"); // TODO switch to an alist at max depth
-        var node = rt.get(.hamt, hamtref);
-        const i = (keyref.hash() >> @intCast(depth * 4)) & 0b1111;
-        if (node[i].isNil()) return hamtref;
-        if (depth < 5) {
-            switch (node[i].kind()) {
+    fn _hamtDissocImpl(rt: *RT, hamtref: *Object, keyref: *Object, depth: u32) ?*Object {
+        std.debug.assert(hamtref.kind == .hamt);
+        var node = hamtref.value(.hamt);
+        const i = (keyref.hash >> @intCast(depth * 2)) & 0b11;
+        if (node[i] == null) return hamtref;
+        if (depth < 11) {
+            switch (node[i].?.kind) {
                 .cons => {
-                    const cons = rt.get(.cons, node[i]);
+                    const cons = node[i].?.value(.cons);
                     if (!rt.eql(cons[0], keyref)) return hamtref;
 
                     // if we're deleting the last child of this node, delete the whole node
                     if (depth > 0) {
                         var n: u32 = 0;
                         for (node) |c| {
-                            if (!c.isNil()) n += 1;
+                            if (c != null) n += 1;
                         }
                         std.debug.assert(n > 0);
-                        if (n == 1) return nil;
+                        if (n == 1) return null;
                     }
 
-                    node[i] = nil;
+                    node[i] = null;
                 },
                 .hamt => {
-                    const result = rt._hamtDissocImpl(node[i], keyref, depth + 1);
+                    const result = rt._hamtDissocImpl(node[i].?, keyref, depth + 1);
                     if (rt.eql(node[i], result)) return hamtref;
                     node[i] = result;
                 },
                 else => unreachable,
             }
         } else {
-            node[i] = rt._alistDissoc(node[i], keyref);
+            node[i] = rt._alistDissoc(node[i].?, keyref);
             // if we emptied the alist and this node is otherwise empty, delete the node
             if (depth > 0) {
                 var n: u32 = 0;
                 for (node) |c| {
-                    if (!c.isNil()) n += 1;
+                    if (c != null) n += 1;
                 }
-                if (n == 0) return nil;
+                if (n == 0) return null;
             }
         }
         return rt.create(.hamt, node);
     }
-    fn _alistDissoc(rt: *RT, alistref: Ref, keyref: Ref) Ref {
-        std.debug.assert(alistref.kind() == .cons);
+    fn _alistDissoc(rt: *RT, alistref: *Object, keyref: *Object) ?*Object {
+        std.debug.assert(alistref.kind == .cons);
         // if we have found the key  return the cdr
         // else create a new cons of the car and recur
         // this adds a bit of unneeded gc churn, but hash collisions shouldn't be that common
-        const cons = rt.get(.cons, alistref);
-        if (rt.eql(rt.get(.cons, cons[0])[0], keyref)) return cons[1];
-        if (cons[1].isNil()) return nil;
-        return rt.create(.cons, .{ cons[0], rt._alistDissoc(cons[0], keyref) });
+        const cons = alistref.value(.cons);
+        if (rt.eql(cons[0].?.value(.cons)[0], keyref)) return cons[1];
+        if (cons[1] == null) return null;
+        return rt.create(.cons, .{ cons[0], rt._alistDissoc(cons[0].?, keyref) });
     }
 
-    fn debugPrint(rt: *RT, ref: Ref) void {
-        if (ref.isNil()) {
-            std.debug.print("nil", .{});
+    fn debugPrint(rt: *RT, ref: *Object) void {
+        if (ref == null) {
+            std.debug.print("null", .{});
         } else {
             rt._debugPrintImpl(ref);
         }
         std.debug.print("\n", .{});
     }
-    fn _debugPrintImpl(rt: *RT, ref: Ref) void {
-        switch (ref.kind()) {
-            .real => std.debug.print("{}", .{rt.get(.real, ref)}),
+    fn _debugPrintImpl(rt: *RT, ref: *Object) void {
+        switch (ref.kind) {
+            .real => std.debug.print("{}", .{ref.value(.real)}),
             .cons => {
-                const cons = rt.get(.cons, ref);
+                const cons = ref.value(.cons);
                 // TODO special case for list printing?
                 std.debug.print("(", .{});
-                if (cons[0].isNil())
-                    std.debug.print("nil", .{})
+                if (cons[0] == null)
+                    std.debug.print("null", .{})
                 else
                     rt._debugPrintImpl(cons[0]);
                 std.debug.print(" . ", .{});
-                if (cons[1].isNil())
-                    std.debug.print("nil", .{})
+                if (cons[1] == null)
+                    std.debug.print("null", .{})
                 else
                     rt._debugPrintImpl(cons[1]);
                 std.debug.print(")", .{});
@@ -247,25 +245,25 @@ const RT = struct {
         }
     }
 
-    fn _debugPrintHamtImpl(rt: *RT, ref: Ref) void {
-        std.debug.assert(ref.kind() == .hamt);
-        const hamt = rt.get(.hamt, ref);
+    fn _debugPrintHamtImpl(rt: *RT, ref: *Object) void {
+        std.debug.assert(ref.kind == .hamt);
+        const hamt = ref.value(.hamt);
 
         for (hamt) |child| {
-            if (child.isNil()) {
+            if (child == null) {
                 // std.debug.print(", ", .{});
                 continue;
             }
-            switch (child.kind()) {
+            switch (child.kind) {
                 .cons => {
-                    const cons = rt.get(.cons, child);
-                    if (cons[0].isNil())
-                        std.debug.print("nil", .{})
+                    const cons = child.value(.cons);
+                    if (cons[0] == null)
+                        std.debug.print("null", .{})
                     else
                         rt._debugPrintImpl(cons[0]);
                     std.debug.print(" ", .{});
-                    if (cons[1].isNil())
-                        std.debug.print("nil", .{})
+                    if (cons[1] == null)
+                        std.debug.print("null", .{})
                     else
                         rt._debugPrintImpl(cons[1]);
                     std.debug.print(",", .{});
@@ -281,11 +279,82 @@ const RT = struct {
 };
 
 pub fn main() !void {
+    // try fillrate();
     // try scratch();
-    // try fuzz();
+    try fuzz();
     try benchmark();
     try benchmarkReference();
 }
+
+fn fillrate() !void {
+    var timer = try std.time.Timer.start();
+
+    const T = struct {
+        x: usize,
+        pad: [3]usize,
+    };
+    const M = 128;
+
+    var pool_a = try BlockPool.init(std.heap.page_allocator);
+    defer pool_a.deinit();
+    var data_a: [1024]*[M]T = undefined;
+
+    timer.reset();
+    for (0..1024) |i| {
+        const a = try pool_a.create([M]T);
+        for (0..M) |j| {
+            a[j].x = j;
+        }
+        data_a[i] = a;
+    }
+    std.debug.print("{}\t{}\n", .{ timer.read(), timer.read() / 1024 / M });
+
+    var pool_b = try BlockPool.init(std.heap.page_allocator);
+    defer pool_b.deinit();
+    var data_b: [1024]*[M]T = undefined;
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+    var shuffle: [M]usize = undefined;
+
+    timer.reset();
+    for (0..1024) |i| {
+        for (0..M) |k| shuffle[k] = k;
+        for (0..M) |k| {
+            const l = rand.intRangeLessThan(usize, k, M);
+            const tmp = shuffle[k];
+            shuffle[k] = shuffle[l];
+            shuffle[l] = tmp;
+        }
+
+        const b = try pool_b.create([M]T);
+        for (0..M) |j| {
+            b[shuffle[j]].x = j;
+        }
+        data_b[i] = b;
+    }
+    std.debug.print("{}\t{}\n", .{ timer.read(), timer.read() / 1024 / M });
+
+    var acc: u64 = 0;
+    for (data_a, data_b) |a, b| {
+        for (0..M) |i| {
+            const j = (b[i].x * 89) % M;
+            acc +%= a[j].x * b[j].x;
+        }
+    }
+    std.debug.print("{}\n", .{acc});
+
+    for (data_a) |a| pool_a.destroy(a);
+    for (data_b) |b| pool_b.destroy(b);
+}
+
+// fn gcperf() !void {
+//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//     const alloc = gpa.allocator();
+//     var gc = try _gc.GC.init(alloc);
+//     defer gc.deinit();
+
+//     for (0..1000000) |_| _ = try gc.create(.real, 0.0);
+// }
 
 fn scratch() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -293,7 +362,7 @@ fn scratch() !void {
     var rt = try RT.init(alloc);
     defer rt.deinit();
 
-    const h0 = rt.create(.hamt, [_]Ref{nil} ** 16);
+    const h0 = rt.create(.hamt, [_]*Object{null} ** 16);
     rt.debugPrint(h0);
 
     const h1a = rt.hamtAssoc(h0, rt.create(.real, 55.0), rt.create(.real, 1.0));
@@ -318,12 +387,14 @@ fn fuzz() !void {
 
     for (ns) |n| {
         std.debug.print("{}\n", .{n});
-        var rt = try RT.init(alloc);
+        var pool = try BlockPool.init(std.heap.page_allocator);
+        defer pool.deinit();
+        var rt = try RT.init(&pool);
         defer rt.deinit();
 
         var h = rt.create(
             .hamt,
-            .{ nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil },
+            [_]?*Object{null} ** 4,
         );
         var s = std.AutoHashMap(u32, u32).init(alloc);
         defer s.deinit();
@@ -334,14 +405,14 @@ fn fuzz() !void {
             const a = rt.create(.real, @floatFromInt(x));
             const b = rt.create(.real, @floatFromInt(y));
 
-            std.debug.print("{} {}\n", .{ rt.hamtContains(h, a), s.contains(x) });
+            // std.debug.print("{} {}\n", .{ rt.hamtContains(h, a), s.contains(x) });
             std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             if (rt.hamtContains(h, a)) {
                 std.debug.assert(
-                    @as(u32, @intFromFloat(rt.get(.real, rt.hamtGet(h, a)))) == s.get(x).?,
+                    @as(u32, @intFromFloat(rt.hamtGet(h, a).?.value(.real))) == s.get(x).?,
                 );
                 const h2 = rt.hamtDissoc(h, a);
-                h = h2;
+                h = h2.?;
                 _ = s.remove(x);
                 std.debug.assert(!rt.hamtContains(h, a));
                 std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
@@ -363,33 +434,40 @@ fn benchmark() !void {
     var rand = rng.random();
     var timer = try std.time.Timer.start();
 
-    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192, 16384 };
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
     const m = 30000;
-    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
+    std.debug.print("cap\tns\tt_gc\tt_fnd\tt_crt\tn_ass\tn_diss\n", .{});
 
     for (ns) |n| {
-        var rt = try RT.init(alloc);
+        var pool = try BlockPool.init(std.heap.page_allocator);
+        defer pool.deinit();
+        var rt = try RT.init(&pool);
         defer rt.deinit();
 
         timer.reset();
         var h = rt.create(
             .hamt,
-            .{ nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil },
+            [_]?*Object{null} ** 4,
         );
 
         var n_assoc: u32 = 0;
         var n_dissoc: u32 = 0;
+        var t_gc: usize = 0;
+        var t_edit: usize = 0;
+        var t_find: usize = 0;
+        var t_create: usize = 0;
+        var acc: f64 = 0;
 
         for (0..m) |k| {
             const x: f64 = @floatFromInt(rand.intRangeLessThan(u32, 0, n));
             const a = rt.create(.real, x);
             const b = rt.create(.real, @floatFromInt(rand.intRangeLessThan(u32, 0, n)));
 
-            // std.debug.print("{d:.2}\t-> {}\n", .{ x, a.hash() });
+            // std.debug.print("{d:.2}\t-> {}\n", .{ x, a.hash });
 
             if (rt.hamtContains(h, a)) {
                 const h2 = rt.hamtDissoc(h, a);
-                h = h2;
+                h = h2.?;
                 n_dissoc += 1;
             } else {
                 const h2 = rt.hamtAssoc(h, a, b);
@@ -398,14 +476,38 @@ fn benchmark() !void {
             }
 
             // _ = k;
-            if (k % 1000 == 0) {
-                rt.gc.trace(h);
-                rt.gc.sweep();
-                rt.gc.compact();
+            if ((k + 1) % 10000 == 0) {
+                const start = timer.read();
+                rt.gc.traceRoot(&h);
+                try rt.gc.collect();
+                t_gc += timer.read() - start;
             }
         }
 
-        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
+        t_edit = timer.lap();
+
+        var to_search = try std.ArrayList(*Object).initCapacity(alloc, m);
+        defer to_search.deinit();
+        for (0..m) |_| {
+            const x: f64 = @floatFromInt(rand.intRangeLessThan(u32, 0, n));
+            const a = rt.create(.real, x);
+            try to_search.append(a);
+        }
+
+        t_create = timer.lap();
+
+        for (0..m) |_k| {
+            const k: f64 = @floatFromInt(_k);
+            const a = to_search.items[_k];
+            if (rt.hamtContains(h, a)) acc += k * rt.hamtGet(h, a).?.value(.real);
+        }
+
+        t_find = timer.read();
+
+        std.debug.print(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t\t{}\n",
+            .{ n, t_edit / m, t_gc / m, t_find / m, t_create / m, n_assoc, n_dissoc, acc },
+        );
     }
 }
 
@@ -418,9 +520,9 @@ fn benchmarkReference() !void {
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
     var timer = try std.time.Timer.start();
-    const ns = [_]u32{ 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384 };
+    const ns = [_]u32{ 32, 64, 128, 256, 612, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
     const m = 30000;
-    std.debug.print("cap\tns\tn_ass\tn_diss\n", .{});
+    std.debug.print("cap\tns\tt_fnd\tn_ass\tn_diss\tn_creat\n", .{});
 
     for (ns) |n| {
         timer.reset();
@@ -428,6 +530,9 @@ fn benchmarkReference() !void {
         defer s.deinit();
         var n_assoc: u32 = 0;
         var n_dissoc: u32 = 0;
+        var t_edit: usize = 0;
+        var t_find: usize = 0;
+        var acc: u64 = 0;
         for (0..m) |_| {
             const a = rand.intRangeLessThan(u64, 0, n);
             const b = rand.intRangeLessThan(u64, 0, n);
@@ -440,6 +545,19 @@ fn benchmarkReference() !void {
                 n_assoc += 1;
             }
         }
-        std.debug.print("{}\t{}\t{}\t{}\n", .{ n, timer.read() / m, n_assoc, n_dissoc });
+
+        t_edit = timer.lap();
+
+        for (0..m) |k| {
+            const a = rand.intRangeLessThan(u64, 0, n);
+            if (s.contains(a)) acc +%= k *% s.get(a).?;
+        }
+
+        t_find = timer.read();
+
+        std.debug.print(
+            "{}\t{}\t{}\t{}\t{}\t\t{}\n",
+            .{ n, t_edit / m, t_find / m, n_assoc, n_dissoc, acc },
+        );
     }
 }
