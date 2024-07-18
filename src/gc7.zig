@@ -19,31 +19,31 @@ pub const Object = extern struct {
 
     pub fn setHash(obj: *Object, hash: u64) void {
         // NOTE we could opt to use different bits of a 64 bit hash depending on quality?
-        obj._property = (obj._property & 0b11_1111_1111) | (hash << 10);
+        obj._property = (obj._property & @as(u64, 0b11_1111_1111)) | (hash << 10);
     }
     pub fn getHash(obj: *Object) u64 {
         return obj._property >> 10;
     }
 
     pub fn setKind(obj: *Object, comptime kind: Kind) void {
-        obj._property = (obj._property & ~0b1111_1111) | kind;
+        obj._property = (obj._property & ~@as(u64, 0b1111_1111)) | @intFromEnum(kind);
     }
     pub fn getKind(obj: *Object) Kind {
         return @enumFromInt(obj._property & @as(u64, 255));
     }
 
     pub fn markUnfinished(obj: *Object) void {
-        obj._property |= 0b10_0000_0000;
+        obj._property |= @as(u64, 0b10_0000_0000);
     }
     pub fn markFinished(obj: *Object) void {
-        obj._property &= ~0b10_0000_0000;
+        obj._property &= ~@as(u64, 0b10_0000_0000);
     }
     pub fn isFinished(obj: *Object) bool {
-        return (obj._property >> 9) & 0b1; // kenobi
+        return obj._property & @as(u64, 0b10_0000_0000) == 0;
     }
 
     pub fn as(obj: *Object, comptime kind: Kind) *ObjectType(kind) {
-        std.debug.assert(obj.kind() == kind);
+        std.debug.assert(obj.getKind() == kind);
         return @alignCast(@ptrCast(obj));
     }
 
@@ -64,7 +64,10 @@ pub const ObjectReal = extern struct {
     data: f64,
 
     pub fn hash(real: *ObjectReal) void {
-        real.head.setHash(std.hash.XxHash3.hash(15345951513627307427, std.mem.asBytes(real.data)));
+        real.head.setHash(std.hash.XxHash3.hash(
+            15345951513627307427, // just a large prime
+            std.mem.asBytes(&real.data),
+        ));
     }
 
     pub fn size() usize {
@@ -96,12 +99,13 @@ pub const ObjectHamt = extern struct {
     pub fn hash(hamt: *ObjectHamt) void {
         var h: u64 = 0;
         const children = hamt.data();
-        for (0..hamt.len()) |i| {
-            h ^= if (children[i]) |child| child.getHash() else NILHASH;
+        for (children[0..hamt.len()]) |child| {
+            h ^= child.getHash();
         }
     }
 
-    pub fn data(hamt: *ObjectHamt) [*]?*Object {
+    pub fn data(hamt: *ObjectHamt) [*]*Object {
+        // NOTE children of hamt are always hamt or cons
         return @ptrFromInt(@intFromPtr(&hamt.mask) + 8);
     }
 
@@ -119,9 +123,10 @@ pub const ObjectString = extern struct {
     len: usize,
 
     pub fn hash(string: *ObjectString) void {
-        string.head.setHash(
-            std.hash.XxHash3.hash(12916058753096001697, std.mem.asBytes(string.data)),
-        );
+        string.head.setHash(std.hash.XxHash3.hash(
+            12916058753096001697, // just a large prime
+            string.data()[0..string.len],
+        ));
     }
 
     pub fn data(string: *ObjectString) [*]u8 {
@@ -259,7 +264,7 @@ pub const GC = struct {
     /// for .string it should be the number of bytes required to store it
     pub fn alloc(gc: *GC, comptime kind: Kind, len: usize) !*ObjectType(kind) {
         if (gc.live == null) try gc.newPage();
-        var result = gc.live.alloc(kind, len);
+        var result = gc.live.?.alloc(kind, len);
         if (result) |r| return r;
         try gc.newPage(); // page couldn't fit our object, make a new one
         result = gc.live.?.alloc(kind, len);
@@ -277,6 +282,7 @@ pub const GC = struct {
         // however, seems kinda nice just for consistency?
         _ = gc;
         std.debug.assert(!obj.head.isFinished());
+        std.debug.assert(obj.head.getKind() == kind);
         obj.hash();
         obj.head.markFinished();
         return @ptrCast(obj);
@@ -373,7 +379,7 @@ pub const GC = struct {
         // (really, a separate allocatioon page for each thread)
         // and use atomics for updating the pointers (?)
         // first, try to update any references using the forwarding pointer
-        switch (obj.kind) {
+        switch (obj.getKind()) {
             .real, .string => {},
             .cons => {
                 const cons = obj.as(.cons);
