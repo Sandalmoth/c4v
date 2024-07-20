@@ -45,8 +45,9 @@ pub const RT = struct {
     }
 
     pub fn hamtAssoc(rt: *RT, objhamt: ?*Object, objkey: ?*Object, objval: ?*Object) *Object {
-        std.debug.assert(objhamt != null); // TODO should return error value i think
-        return rt._hamtAssocImpl(objhamt.?, objkey, objval, 0);
+        // inserting into nil just creates a new map
+        const obj = objhamt orelse rt.newHamt();
+        return rt._hamtAssocImpl(obj, objkey, objval, 0);
     }
     fn _hamtAssocImpl(
         rt: *RT,
@@ -58,7 +59,6 @@ pub const RT = struct {
         const hamt = objhamt.as(.hamt);
         const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
         const packed_index = @popCount(hamt.mask & ((@as(u64, 1) << @intCast(slot)) - 1));
-
         if (hamt.mask & (@as(u64, 1) << @intCast(slot)) == 0) {
             // empty slot, insert here
             const new = rt.gc.alloc(.hamt, hamt.len() + 1) catch @panic("GC allocation failure");
@@ -83,7 +83,7 @@ pub const RT = struct {
                     new.data()[packed_index] = rt.newCons(objkey, objval);
                 } else {
                     // generate new subtree and traverse
-                    // TODO try fastpath if cons.car and objkey doesn't collide at depth + 1
+                    // TODO? try fastpath if cons.car and objkey doesn't collide at depth + 1
                     const subslot = if (cons.car) |car|
                         car.getHashAtDepth(depth + 1)
                     else
@@ -108,8 +108,8 @@ pub const RT = struct {
     }
 
     pub fn hamtGet(rt: *RT, objhamt: ?*Object, objkey: ?*Object) ?*Object {
-        std.debug.assert(objhamt != null); // TODO what should happen in this case?
-        return rt._hamtGetImpl(objhamt.?, objkey, 0);
+        const obj = objhamt orelse return null;
+        return rt._hamtGetImpl(obj, objkey, 0);
     }
     pub fn _hamtGetImpl(rt: *RT, objhamt: *Object, objkey: ?*Object, depth: usize) ?*Object {
         const hamt = objhamt.as(.hamt);
@@ -128,8 +128,73 @@ pub const RT = struct {
     }
 
     pub fn hamtContains(rt: *RT, objhamt: ?*Object, objkey: ?*Object) bool {
-        std.debug.assert(objhamt != null); // TODO what should happen in this case?
-        return rt._hamtGetImpl(objhamt.?, objkey, 0) != null;
+        const obj = objhamt orelse return false;
+        return rt._hamtGetImpl(obj, objkey, 0) != null;
+    }
+
+    pub fn hamtDissoc(rt: *RT, objhamt: ?*Object, objkey: ?*Object) ?*Object {
+        const obj = objhamt orelse return null;
+        const result = rt._hamtDissocImpl(obj, objkey, 0);
+        if (result == null) return rt.newHamt();
+        if (result.?.getKind() == .cons) {
+            const cons = result.?.as(.cons);
+            const slot = if (cons.car) |k| k.getHashAtDepth(0) else NILHASH & 0b11_1111;
+            const new = rt.gc.alloc(.hamt, 1) catch @panic("GC allocation failure");
+            new.mask = (@as(u64, 1) << @intCast(slot));
+            new.data()[0] = result.?;
+            return rt.gc.commit(.hamt, new);
+        }
+        return result.?;
+    }
+    pub fn _hamtDissocImpl(rt: *RT, objhamt: *Object, objkey: ?*Object, depth: usize) ?*Object {
+        const hamt = objhamt.as(.hamt);
+        const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
+        // if child slot for key is not occupied, return with no changes
+        if (hamt.mask & (@as(u64, 1) << @intCast(slot)) == 0) return objhamt;
+        const packed_index = @popCount(hamt.mask & ((@as(u64, 1) << @intCast(slot)) - 1));
+        const child = hamt.data()[packed_index];
+
+        switch (child.getKind()) {
+            .cons => {
+                const cons = child.as(.cons);
+                if (!eql(cons.car, objkey)) return objhamt; // key is not present
+                // key is present, actually delete something
+                // handle cases where this hamt level isn't needed after the delete
+                if (hamt.len() == 1) return null;
+                if (hamt.len() == 2) return hamt.data()[if (packed_index == 0) 1 else 0];
+                // delete and preserve level
+                const new = rt.gc.alloc(.hamt, hamt.len() - 1) catch
+                    @panic("GC allocation failure");
+                new.mask = hamt.mask & ~(@as(u64, 1) << @intCast(slot));
+                @memcpy(new.data(), hamt.data()[0..packed_index]);
+                @memcpy(new.data()[packed_index..], hamt.data()[packed_index + 1 .. hamt.len()]);
+                return rt.gc.commit(.hamt, new);
+            },
+            .hamt => {
+                // recur and if a deletion happened at the sublevel, update to include it
+                const result = rt._hamtDissocImpl(child, objkey, depth + 1);
+                if (eql(child, result)) return objhamt;
+                if (result == null) {
+                    // if the sublevel deletion resulted in a node deletion
+                    // we need to downsize (and possibly delete) ourselves as well
+                    if (hamt.len() == 1) return null;
+                    if (hamt.len() == 2) return hamt.data()[if (packed_index == 0) 1 else 0];
+                    const new = rt.gc.alloc(.hamt, hamt.len()) catch
+                        @panic("GC allocation failure");
+                    new.mask = hamt.mask & ~(@as(u64, 1) << @intCast(slot));
+                    @memcpy(new.data(), hamt.data()[0..packed_index]);
+                    @memcpy(new.data()[packed_index..], hamt.data()[packed_index + 1 .. hamt.len()]);
+                    return rt.gc.commit(.hamt, new);
+                }
+                const new = rt.gc.alloc(.hamt, hamt.len()) catch
+                    @panic("GC allocation failure");
+                new.mask = hamt.mask;
+                @memcpy(new.data(), hamt.data()[0..hamt.len()]);
+                new.data()[packed_index] = result.?;
+                return rt.gc.commit(.hamt, new);
+            },
+            else => unreachable,
+        }
     }
 };
 
@@ -246,6 +311,8 @@ fn scratch() !void {
     const f = rt.newCons(c, e);
     const g = rt.hamtAssoc(d, a, b);
     const h = rt.hamtAssoc(g, b, a);
+    const i = rt.hamtDissoc(h, a);
+    const j = rt.hamtDissoc(i, b);
 
     try print(null, stdout);
     try print(a, stdout);
@@ -256,10 +323,12 @@ fn scratch() !void {
     try print(f, stdout);
     try print(g, stdout);
     try print(h, stdout);
+    try print(i, stdout);
+    try print(j, stdout);
 }
 
 fn fuzz() !void {
-    // const stdout = std.io.getStdOut().writer();
+    const stdout = std.io.getStdOut().writer();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
@@ -271,7 +340,7 @@ fn fuzz() !void {
     const m = 10000;
 
     for (ns) |n| {
-        // std.debug.print("n = {}\n", .{n});
+        std.debug.print("n = {}\n", .{n});
         var rt = try RT.init(&pool);
         defer rt.deinit();
         var h = rt.newHamt();
@@ -285,19 +354,17 @@ fn fuzz() !void {
             const a = rt.newReal(@floatFromInt(x));
             const b = rt.newReal(@floatFromInt(y));
 
-            // try print(h, stdout);
-            // std.debug.print("key = {} ({})\n", .{ x, rt.hamtContains(h, a) });
+            try print(h, stdout);
+            std.debug.print("key = {} ({})\n", .{ x, rt.hamtContains(h, a) });
 
             std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             if (rt.hamtContains(h, a)) {
                 std.debug.assert(
                     @as(u32, @intFromFloat(rt.hamtGet(h, a).?.as(.real).data)) == s.get(x).?,
                 );
-                // const h2 = rt.hamtDissoc(h, a);
-                // h = h2.?;
-                // _ = s.remove(x);
-                // std.debug.assert(!rt.hamtContains(h, a));
-                // std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
+                const h2 = rt.hamtDissoc(h, a);
+                h = h2.?;
+                _ = s.remove(x);
             } else {
                 const h2 = rt.hamtAssoc(h, a, b);
                 h = h2;
