@@ -2,7 +2,7 @@ const std = @import("std");
 
 const BlockPool = @import("blockpool.zig").BlockPool(.{});
 
-const NILHASH: u64 = 0xb4b4b4b4b4b4b4b4;
+pub const NILHASH: u64 = 0xb4b4b4b4b4b4b4b4;
 
 pub const Kind = enum(u8) {
     real,
@@ -23,6 +23,11 @@ pub const Object = extern struct {
     }
     pub fn getHash(obj: *Object) u64 {
         return obj._property >> 10;
+    }
+    pub fn getHashAtDepth(obj: *Object, depth: usize) u64 {
+        std.debug.assert(depth < 9); // TODO generate infinite bits on demand
+        const h = obj.getHash();
+        return (h >> @intCast(depth * 6)) & 0b11_1111;
     }
 
     pub fn setKind(obj: *Object, comptime kind: Kind) void {
