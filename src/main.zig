@@ -60,7 +60,6 @@ pub const RT = struct {
         const packed_index = @popCount(hamt.mask & ((@as(u64, 1) << @intCast(slot)) - 1));
 
         if (hamt.mask & (@as(u64, 1) << @intCast(slot)) == 0) {
-            std.debug.print("empty slot insert\n", .{});
             // empty slot, insert here
             const new = rt.gc.alloc(.hamt, hamt.len() + 1) catch @panic("GC allocation failure");
             new.mask = hamt.mask | (@as(u64, 1) << @intCast(slot));
@@ -80,11 +79,9 @@ pub const RT = struct {
             .cons => {
                 const cons = child.as(.cons);
                 if (eql(cons.car, objkey)) {
-                    std.debug.print("replace insert\n", .{});
                     // replace key in this slot
                     new.data()[packed_index] = rt.newCons(objkey, objval);
                 } else {
-                    std.debug.print("subtree insert\n", .{});
                     // generate new subtree and traverse
                     // TODO try fastpath if cons.car and objkey doesn't collide at depth + 1
                     const subslot = if (cons.car) |car|
@@ -198,7 +195,7 @@ fn _printImpl(_obj: ?*Object, writer: anytype) anyerror!void {
         },
         .hamt => {
             try writer.print("{{", .{});
-            try _printHamt(obj, writer);
+            try _printHamt(obj, true, writer);
             try writer.print("}}", .{});
         },
         .string => {
@@ -208,7 +205,7 @@ fn _printImpl(_obj: ?*Object, writer: anytype) anyerror!void {
     }
 }
 
-fn _printHamt(obj: *Object, writer: anytype) anyerror!void {
+fn _printHamt(obj: *Object, first: bool, writer: anytype) anyerror!void {
     std.debug.assert(obj.getKind() == .hamt);
     const hamt = obj.as(.hamt);
     const children = hamt.data();
@@ -216,13 +213,13 @@ fn _printHamt(obj: *Object, writer: anytype) anyerror!void {
         const child = children[i];
         switch (child.getKind()) {
             .cons => {
-                if (i > 0) try writer.print(", ", .{});
+                if (!first or i > 0) try writer.print(", ", .{});
                 const cons = child.as(.cons);
                 try _printImpl(cons.car, writer);
                 try writer.print(" ", .{});
                 try _printImpl(cons.cdr, writer);
             },
-            .hamt => try _printHamt(child, writer),
+            .hamt => try _printHamt(child, first and i == 0, writer),
             else => unreachable,
         }
     }
@@ -262,7 +259,7 @@ fn scratch() !void {
 }
 
 fn fuzz() !void {
-    const stdout = std.io.getStdOut().writer();
+    // const stdout = std.io.getStdOut().writer();
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
@@ -270,11 +267,11 @@ fn fuzz() !void {
     var pool = try BlockPool.init(std.heap.page_allocator);
     defer pool.deinit();
 
-    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768 };
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072 };
     const m = 10000;
 
     for (ns) |n| {
-        std.debug.print("n = {}\n", .{n});
+        // std.debug.print("n = {}\n", .{n});
         var rt = try RT.init(&pool);
         defer rt.deinit();
         var h = rt.newHamt();
@@ -288,8 +285,8 @@ fn fuzz() !void {
             const a = rt.newReal(@floatFromInt(x));
             const b = rt.newReal(@floatFromInt(y));
 
-            try print(h, stdout);
-            std.debug.print("key = {}\n", .{x});
+            // try print(h, stdout);
+            // std.debug.print("key = {} ({})\n", .{ x, rt.hamtContains(h, a) });
 
             std.debug.assert(rt.hamtContains(h, a) == s.contains(x));
             if (rt.hamtContains(h, a)) {

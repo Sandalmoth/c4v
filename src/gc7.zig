@@ -2,7 +2,7 @@ const std = @import("std");
 
 const BlockPool = @import("blockpool.zig").BlockPool(.{});
 
-pub const NILHASH: u64 = 0xb4b4b4b4b4b4b4b4;
+pub const NILHASH: u64 = 0xD34D34D34D34D34;
 
 pub const Kind = enum(u8) {
     real,
@@ -195,6 +195,7 @@ const Page = struct {
 
         if (offset <= page.data.len) {
             const obj: *ObjectType(kind) = @alignCast(@ptrCast(&page.data[addr]));
+            obj.head._property = 0; // NOTE very important to set the unused bit consistently
             obj.head.markUnfinished();
             obj.head.setKind(kind);
             obj.head.fwd = @ptrCast(obj);
