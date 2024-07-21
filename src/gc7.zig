@@ -319,7 +319,8 @@ pub const GC = struct {
             },
         }
         new.head._property = old.head._property;
-        return new;
+        new.head.markUnfinished(); // or it triggers assert in commit
+        return gc.commit(kind, new);
     }
 
     fn newPage(gc: *GC) !void {
@@ -377,6 +378,7 @@ pub const GC = struct {
             walk = p.next;
             gc.pool.destroy(p);
         }
+        gc.discard = null;
     }
 
     fn trace(gc: *GC, ptr: ?*Object) !void {
@@ -389,20 +391,21 @@ pub const GC = struct {
             .real, .string => {},
             .cons => {
                 const cons = obj.as(.cons);
-                if (cons.data[0]) |car| cons.data[0] = car.fwd;
-                if (cons.data[1]) |cdr| cons.data[1] = cdr.fwd;
+                if (cons.car) |car| cons.car = car.fwd;
+                if (cons.cdr) |cdr| cons.cdr = cdr.fwd;
             },
             .hamt => {
                 const hamt = obj.as(.hamt);
-                for (0..hamt.data.len) |i| {
-                    if (hamt.data[i]) |child| hamt.data[i] = child.fwd;
-                } // cant make this a oneliner, compiler bug?
+                for (0..hamt.len()) |i| {
+                    const child = hamt.data()[i];
+                    hamt.data()[i] = child.fwd;
+                }
             },
         }
         // now, replicate if we are on a marked page
         // and we haven't already been replicated
         if (obj == obj.fwd and obj.page().mark) {
-            const r = switch (obj.kind) {
+            const r = switch (obj.getKind()) {
                 .real => try gc.dup(.real, obj),
                 .cons => try gc.dup(.cons, obj),
                 .hamt => try gc.dup(.hamt, obj),
@@ -412,7 +415,7 @@ pub const GC = struct {
         }
 
         // finally, keep tracing
-        switch (obj.kind) {
+        switch (obj.getKind()) {
             .real, .string => {},
             .cons => {
                 const cons = obj.as(.cons);

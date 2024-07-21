@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Config = struct {
-    block_size: comptime_int = 4 * 1024,
+    block_size: comptime_int = std.mem.page_size,
     reserve: comptime_int = 1024,
     preheat: comptime_int = 1024,
     thread_safe: bool = !builtin.single_threaded,
@@ -44,7 +44,7 @@ pub fn BlockPool(comptime config: Config) type {
                 .n_total = 0,
                 .n_allocs = 0,
             };
-            while (pool.n_free < config.reserve) {
+            while (pool.n_free < config.preheat) {
                 pool.free[pool.n_free] = try alloc.create(Block);
                 errdefer pool.deinit();
                 pool.n_free += 1;
