@@ -25,10 +25,16 @@ fn scratch() !void {
 
     var h = rt.newChamp();
     debugPrint8(h);
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newReal(1.0))});
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newString("world"))});
     h = rt.champAssoc(h, rt.newReal(1.0), rt.newString("hello"));
     debugPrint8(h);
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newReal(1.0))});
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newString("world"))});
     h = rt.champAssoc(h, rt.newString("world"), rt.newReal(2.0));
     debugPrint8(h);
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newReal(1.0))});
+    std.debug.print("{}\n", .{rt.champContains(h, rt.newString("world"))});
 }
 
 fn fuzz7() !void {
@@ -149,20 +155,25 @@ fn fuzz8() !void {
             const a = rt.newReal(@floatFromInt(x));
             const b = rt.newReal(@floatFromInt(y));
 
-            //     std.debug.assert(rt.champContains(h, a) == s.contains(x));
-            //     if (rt.champContains(h, a)) {
-            //         std.debug.assert(
-            //             @as(u32, @intFromFloat(rt.champGet(h, a).?.as(.real).data)) == s.get(x).?,
-            //         );
-            //         const h2 = rt.champDissoc(h, a);
-            //         h = h2.?;
-            //         _ = s.remove(x);
-            //     } else {
-            const h2 = rt.champAssoc(h, a, b);
-            h = h2;
+            // debugPrint8(a);
+            // debugPrint8(b);
             // debugPrint8(h);
-            //         try s.put(x, y);
-            //     }
+            // std.debug.print("{} {}\n", .{ rt.champContains(h, a), s.contains(x) });
+
+            std.debug.assert(rt.champContains(h, a) == s.contains(x));
+            if (rt.champContains(h, a)) {
+                //         std.debug.assert(
+                //             @as(u32, @intFromFloat(rt.champGet(h, a).?.as(.real).data)) == s.get(x).?,
+                //         );
+                //         const h2 = rt.champDissoc(h, a);
+                //         h = h2.?;
+                //         _ = s.remove(x);
+            } else {
+                const h2 = rt.champAssoc(h, a, b);
+                h = h2;
+                // debugPrint8(h);
+                try s.put(x, y);
+            }
 
             _ = i;
             _ = o;

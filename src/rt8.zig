@@ -152,95 +152,47 @@ pub const RT = struct {
         const newnodes = new.nodes();
         const oldnodes = champ.nodes();
         @memcpy(newnodes[0..], oldnodes[0..packed_node_index]);
-        newnodes[packed_node_index] = rt.gc.commit(.champ, sub);
+        newnodes[packed_node_index] = rt._champAssocImpl(
+            rt.gc.commit(.champ, sub),
+            objkey,
+            objval,
+            depth + 1,
+        );
         @memcpy(newnodes[packed_node_index + 1 ..], oldnodes[packed_node_index..champ.nodelen]);
 
         return rt.gc.commit(.champ, new);
-
-        // const packed_index = @popCount(hamt.mask & ((@as(u64, 1) << @intCast(slot)) - 1));
-        // if (hamt.mask & (@as(u64, 1) << @intCast(slot)) == 0) {
-        //     // empty slot, insert here
-        //     const new = rt.gc.alloc(.hamt, hamt.len() + 1) catch @panic("GC allocation failure");
-        //     new.mask = hamt.mask | (@as(u64, 1) << @intCast(slot));
-        //     // shuffle the entries in the old hamt to make space
-        //     @memcpy(new.data(), hamt.data()[0..packed_index]);
-        //     new.data()[packed_index] = rt.newCons(objkey, objval);
-        //     @memcpy(new.data()[packed_index + 1 ..], hamt.data()[packed_index..hamt.len()]);
-        //     return rt.gc.commit(.hamt, new);
-        // }
-
-        // // occupied slot, either insert, traverse, or create a new subtree and traverse
-        // const child = hamt.data()[packed_index];
-        // const new = rt.gc.alloc(.hamt, hamt.len()) catch @panic("GC allocation failure");
-        // new.mask = hamt.mask;
-        // @memcpy(new.data(), hamt.data()[0..hamt.len()]);
-        // switch (child.getKind()) {
-        //     .cons => {
-        //         const cons = child.as(.cons);
-        //         if (rt.eql(cons.car, objkey)) {
-        //             // replace key in this slot
-        //             new.data()[packed_index] = rt.newCons(objkey, objval);
-        //         } else {
-        //             // generate new subtree and traverse
-        //             // TODO? try fastpath if cons.car and objkey doesn't collide at depth + 1
-        //             const subslot = if (cons.car) |car|
-        //                 car.getHashAtDepth(depth + 1)
-        //             else
-        //                 NILHASH & 0b11_1111;
-        //             const sub = rt.gc.alloc(.hamt, 1) catch @panic("GC allocation failure");
-        //             sub.mask = @as(u64, 1) << @intCast(subslot);
-        //             sub.data()[0] = child;
-        //             new.data()[packed_index] = rt._hamtAssocImpl(
-        //                 rt.gc.commit(.hamt, sub),
-        //                 objkey,
-        //                 objval,
-        //                 depth + 1,
-        //             );
-        //         }
-        //     },
-        //     .hamt => {
-        //         new.data()[packed_index] = rt._hamtAssocImpl(child, objkey, objval, depth + 1);
-        //     },
-        //     else => unreachable,
-        // }
-        // return rt.gc.commit(.hamt, new);
     }
 
-    pub fn hamtGet(rt: *RT, objhamt: ?*Object, objkey: ?*Object) ?*Object {
-        const obj = objhamt orelse return null;
-        return rt._hamtGetImpl(obj, objkey, 0);
+    pub fn champGet(rt: *RT, objchamp: ?*Object, objkey: ?*Object) ?*Object {
+        const obj = objchamp orelse return null;
+        return rt._champGetImpl(obj, objkey, 0);
     }
-    pub fn _hamtGetImpl(rt: *RT, objhamt: *Object, objkey: ?*Object, depth: usize) ?*Object {
-        // debugPrint(objhamt);
-        const hamt = objhamt.as(.hamt);
+    pub fn _champGetImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) ?*Object {
+        const champ = objchamp.as(.champ);
         const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
-        // std.debug.print("{} {} {b}\n", .{ hamt.len(), slot, hamt.mask });
-        if (hamt.mask & (@as(u64, 1) << @intCast(slot)) == 0) return null;
-        const packed_index = @popCount(hamt.mask & ((@as(u64, 1) << @intCast(slot)) - 1));
-        const child = hamt.data()[packed_index];
+        const slotmask = @as(u64, 1) << @intCast(slot);
+        const is_data = champ.datamask & slotmask > 0;
+        const is_node = champ.nodemask & slotmask > 0;
+        std.debug.assert(!(is_data and is_node));
 
-        // for (0..hamt.len()) |i| {
-        //     if (i == packed_index) {
-        //         std.debug.print("### {} ###\t", .{i});
-        //     } else {
-        //         std.debug.print("--- {} ---\t", .{i});
-        //     }
-        //     debugPrint(hamt.data()[i]);
-        // }
+        if (!(is_node or is_data)) return null;
 
-        return switch (child.getKind()) {
-            .cons => blk: {
-                const cons = child.as(.cons);
-                break :blk if (rt.eql(cons.car, objkey)) cons.cdr else null;
-            },
-            .hamt => rt._hamtGetImpl(child, objkey, depth + 1),
-            else => unreachable,
-        };
+        if (is_node) {
+            const packed_index = @popCount(champ.nodemask & (slotmask - 1));
+            return rt._champGetImpl(champ.nodes()[packed_index], objkey, depth + 1);
+        }
+
+        const packed_index = @popCount(champ.datamask & (slotmask - 1));
+        if (rt.eql(champ.data()[2 * packed_index], objkey)) {
+            return champ.data()[2 * packed_index + 1];
+        }
+
+        return null;
     }
 
-    pub fn hamtContains(rt: *RT, objhamt: ?*Object, objkey: ?*Object) bool {
-        const obj = objhamt orelse return false;
-        return rt._hamtGetImpl(obj, objkey, 0) != null;
+    pub fn champContains(rt: *RT, objchamp: ?*Object, objkey: ?*Object) bool {
+        const obj = objchamp orelse return false;
+        return rt._champGetImpl(obj, objkey, 0) != null;
     }
 
     // NOTE This implementation does not maintain a canonical representation
