@@ -167,7 +167,7 @@ pub const RT = struct {
         const obj = objchamp orelse return null;
         return rt._champGetImpl(obj, objkey, 0);
     }
-    pub fn _champGetImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) ?*Object {
+    fn _champGetImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) ?*Object {
         const champ = objchamp.as(.champ);
         const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
         const slotmask = @as(u64, 1) << @intCast(slot);
@@ -176,23 +176,113 @@ pub const RT = struct {
         std.debug.assert(!(is_data and is_node));
 
         if (!(is_node or is_data)) return null;
-
         if (is_node) {
             const packed_index = @popCount(champ.nodemask & (slotmask - 1));
             return rt._champGetImpl(champ.nodes()[packed_index], objkey, depth + 1);
         }
-
         const packed_index = @popCount(champ.datamask & (slotmask - 1));
         if (rt.eql(champ.data()[2 * packed_index], objkey)) {
             return champ.data()[2 * packed_index + 1];
         }
-
         return null;
     }
 
     pub fn champContains(rt: *RT, objchamp: ?*Object, objkey: ?*Object) bool {
         const obj = objchamp orelse return false;
         return rt._champGetImpl(obj, objkey, 0) != null;
+    }
+
+    pub fn champDissoc(rt: *RT, objchamp: ?*Object, objkey: ?*Object) ?*Object {
+        const obj = objchamp orelse return null;
+        return rt._champDissocImpl(obj, objkey, 0);
+    }
+    fn _champDissocImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) *Object {
+        const champ = objchamp.as(.champ);
+        const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
+        const slotmask = @as(u64, 1) << @intCast(slot);
+        const is_data = champ.datamask & slotmask > 0;
+        const is_node = champ.nodemask & slotmask > 0;
+        std.debug.assert(!(is_data and is_node));
+
+        if (!(is_data or is_node)) return objchamp;
+
+        if (is_data) {
+            const packed_index = @popCount(champ.datamask & (slotmask - 1));
+            if (!rt.eql(champ.data()[2 * packed_index], objkey)) return objchamp;
+            if (champ.datalen + champ.nodelen == 1) return rt.newChamp();
+            const new = rt.gc.alloc(.champ, 2 * (champ.datalen - 1) + champ.nodelen) catch
+                @panic("GC allocation failure");
+            new.datamask = champ.datamask & ~slotmask;
+            new.nodemask = champ.nodemask;
+            new.datalen = champ.datalen - 1;
+            new.nodelen = champ.nodelen;
+            const newdata = new.data();
+            const olddata = champ.data();
+            @memcpy(newdata[0..], olddata[0 .. 2 * packed_index]);
+            @memcpy(
+                newdata[2 * packed_index ..],
+                olddata[2 * packed_index + 2 .. 2 * champ.datalen + champ.nodelen],
+            );
+            return rt.gc.commit(.champ, new);
+        }
+
+        const packed_index = @popCount(champ.nodemask & (slotmask - 1));
+        const objresult = rt._champDissocImpl(champ.nodes()[packed_index], objkey, depth + 1);
+        if (rt.eql(champ.nodes()[packed_index], objresult)) return objchamp;
+
+        const result = objresult.as(.champ);
+        if (result.nodelen == 0 and result.datalen == 1) {
+            if (champ.datalen + champ.nodelen == 1) {
+                // this node has only one child
+                // and that child is just a kv after the deletion
+                // so we can just keep that kv and get rid of this node
+                return objresult;
+            } else {
+                // a node child of this node is now just a kv
+                // so store that kv directly here instead
+                // (node without subnode) with key
+                const packed_data_index = @popCount(champ.datamask & (slotmask - 1));
+                const packed_node_index = @popCount(champ.nodemask & (slotmask - 1));
+                const new = rt.gc.alloc(.champ, 2 * (champ.datalen + 1) + champ.nodelen - 1) catch
+                    @panic("GC allocation failure");
+                new.datamask = champ.datamask | slotmask;
+                new.nodemask = champ.nodemask & ~slotmask;
+                new.datalen = champ.datalen + 1;
+                new.nodelen = champ.nodelen - 1;
+                const newdata = new.data();
+                const olddata = champ.data();
+                @memcpy(newdata[0..], olddata[0 .. 2 * packed_data_index]);
+                newdata[2 * packed_data_index] = result.data()[0];
+                newdata[2 * packed_data_index + 1] = result.data()[1];
+                @memcpy(
+                    newdata[2 * packed_data_index + 2 ..],
+                    olddata[2 * packed_data_index .. 2 * champ.datalen],
+                );
+                const newnodes = new.nodes();
+                const oldnodes = champ.nodes();
+                @memcpy(newnodes[0..], oldnodes[0..packed_node_index]);
+                @memcpy(
+                    newnodes[packed_node_index..],
+                    oldnodes[packed_node_index + 1 .. champ.nodelen],
+                );
+                return rt.gc.commit(.champ, new);
+            }
+        }
+        // node updated with result
+        // the node child of this node has been altered but is still a node
+        // so just replace that node-child with the result
+        std.debug.assert(result.datalen + result.nodelen > 0);
+        const new = rt.gc.alloc(.champ, 2 * champ.datalen + champ.nodelen) catch
+            @panic("GC allocation failure");
+        new.datamask = champ.datamask;
+        new.nodemask = champ.nodemask;
+        new.datalen = champ.datalen;
+        new.nodelen = champ.nodelen;
+        const newdata = new.data();
+        const olddata = champ.data();
+        @memcpy(newdata[0..], olddata[0 .. 2 * champ.datalen + champ.nodelen]);
+        new.nodes()[packed_index] = objresult;
+        return rt.gc.commit(.champ, new);
     }
 
     // NOTE This implementation does not maintain a canonical representation

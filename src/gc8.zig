@@ -331,6 +331,8 @@ pub const GC = struct {
             .champ => {
                 new.datamask = old.datamask;
                 new.nodemask = old.nodemask;
+                new.datalen = old.datalen;
+                new.nodelen = old.nodelen;
                 @memcpy(new.data(), old.data()[0 .. 2 * old.datalen + old.nodelen]);
             },
             .string => {
@@ -398,14 +400,16 @@ pub const GC = struct {
         var n_survivors_compacted: usize = 0;
         var parent: *?*Page = &gc.survivor;
         var walk = gc.survivor;
-        while (walk) |*p| {
-            if (gc.rng.random().float(f64) > gc.survivor_compact_probability) {
-                parent = @ptrCast(p);
+        while (walk) |p| {
+            if (gc.rng.random().float(f64) < gc.survivor_compact_probability) {
+                parent.* = p.next;
+                walk = p.next;
+                p.next = gc.from;
+                gc.from = p;
+            } else {
+                parent = &p.next;
+                walk = p.next;
             }
-            parent.* = p.*.next;
-            walk = p.*.next;
-            p.*.next = gc.from;
-            gc.from = p.*;
             n_survivors_compacted += 1;
         }
 
@@ -413,6 +417,7 @@ pub const GC = struct {
         walk = gc.from;
         while (walk) |p| {
             p.mark = true;
+            walk = p.next;
             from_space_size += 1;
         }
 
@@ -430,10 +435,18 @@ pub const GC = struct {
         // the more survivor pages we should try to compact next time
         // as the survivor space contained a lot of garbage
         // and vice versa
-        std.debug.print("compact p = {}\n", .{gc.survivor_compact_probability});
-        std.debug.print("n survivors = {}\n", .{n_survivors_compacted});
-        std.debug.print("n from-space = {}\n", .{from_space_size});
-        std.debug.print("collect allocs = {}\n", .{gc.collect_alloc_counter});
+
+        // assume that the odds of surviving is the same in eden and survivor space (tunable?)
+        const ratio = @as(f64, @floatFromInt(gc.collect_alloc_counter)) /
+            @as(f64, @floatFromInt(from_space_size));
+        gc.survivor_compact_probability = 1.0 - ratio;
+        gc.survivor_compact_probability = 1.0;
+
+        // std.debug.print("compact p = {}\n", .{gc.survivor_compact_probability});
+        // std.debug.print("n survivors = {}\n", .{n_survivors_compacted});
+        // std.debug.print("n from-space = {}\n", .{from_space_size});
+        // std.debug.print("collect allocs = {}\n", .{gc.collect_alloc_counter});
+        // std.debug.print("ratio = {}\n", .{ratio});
     }
 
     fn trace(gc: *GC, ptr: ?*Object) !void {
@@ -480,8 +493,11 @@ pub const GC = struct {
             },
             .champ => {
                 const champ = obj.as(.champ);
-                // TODO evaluate if tracing nodes before data (or any other order) is best
-                for (0..2 * champ.datalen + champ.nodelen) |i| try gc.trace(champ.data()[i]);
+                // i think this tracing-order is marginally better
+                // but would need careful benchmarking, it's not a huge difference
+                for (0..champ.nodelen) |i| try gc.trace(champ.nodes()[i]);
+                for (0..champ.datalen) |i| try gc.trace(champ.data()[2 * i]);
+                for (0..champ.datalen) |i| try gc.trace(champ.data()[2 * i + 1]);
             },
         }
     }
