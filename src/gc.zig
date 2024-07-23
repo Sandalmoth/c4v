@@ -15,7 +15,7 @@ pub fn KindType(comptime kind: Kind) type {
     return switch (kind) {
         .real => f64,
         .cons => [2]Ref,
-        .hamt => [16]Ref,
+        .hamt => [4]Ref,
     };
 }
 
@@ -155,6 +155,7 @@ fn SingularGCType(comptime kind: Kind) type {
         }
 
         fn newActivePage(sgc: *SGC, comptime first_time: bool) !void {
+            // std.debug.print("new active page for {}\n", .{kind});
             // NOTE order ensures an error doesn't break the structure we have
             if (!first_time) {
                 try sgc.inactive_pages.ensureUnusedCapacity(1);
@@ -349,11 +350,14 @@ pub const GC = struct {
 
     rng: *std.Random.DefaultPrng,
 
+    n_created: usize,
+
     pub fn init(alloc: std.mem.Allocator) !GC {
         var gc = GC{
             .alloc = alloc,
             .sgcs = undefined,
             .rng = try alloc.create(std.Random.DefaultPrng),
+            .n_created = 0,
         };
         gc.rng.* = std.Random.DefaultPrng.init(
             (@as(u64, @bitCast(std.time.microTimestamp())) | 1) *% 11400714819323198393,
@@ -412,6 +416,7 @@ pub const GC = struct {
                 break :blk h;
             },
         };
+        gc.n_created += 1;
         return gc.getSGC(kind).create(val, hash);
     }
 
