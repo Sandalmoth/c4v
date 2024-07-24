@@ -51,6 +51,10 @@ pub const RT = struct {
         keyhash: u64,
         depth: usize,
 
+        // though it wastes some bits in the hash
+        // the improved performance on divide and modulo seems to be worth it
+        const LEVELS_PER_HASH = 8;
+
         fn init(objkey: ?*Object) ChampKeyContext {
             return .{
                 .objkey = objkey,
@@ -62,7 +66,7 @@ pub const RT = struct {
         fn initDepth(objkey: ?*Object, depth: usize) ChampKeyContext {
             return .{
                 .objkey = objkey,
-                .keyhash = Object.hash(objkey, depth / 10),
+                .keyhash = Object.hash(objkey, depth / LEVELS_PER_HASH),
                 .depth = depth,
             };
         }
@@ -73,14 +77,14 @@ pub const RT = struct {
                 .keyhash = old.keyhash,
                 .depth = old.depth + 1,
             };
-            if (old.depth / 10 < new.depth / 10) {
-                new.keyhash = Object.hash(new.objkey, new.depth / 10);
+            if (old.depth / LEVELS_PER_HASH < new.depth / LEVELS_PER_HASH) {
+                new.keyhash = Object.hash(new.objkey, new.depth / LEVELS_PER_HASH);
             }
             return new;
         }
 
         fn slot(ctx: ChampKeyContext) usize {
-            return (ctx.keyhash >> @intCast((ctx.depth % 10) * 6)) & 0b11_1111;
+            return (ctx.keyhash >> @intCast((ctx.depth % LEVELS_PER_HASH) * 6)) & 0b11_1111;
         }
     };
 
