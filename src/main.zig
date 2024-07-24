@@ -44,8 +44,8 @@ fn fuzz7() !void {
     var pool = try BlockPool.init(std.heap.page_allocator);
     defer pool.deinit();
 
-    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072 };
-    const m = 10000;
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
     const o = 1000;
 
     for (ns) |n| {
@@ -90,8 +90,8 @@ fn bench7() !void {
     var pool = try BlockPool.init(std.heap.page_allocator);
     defer pool.deinit();
 
-    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072 };
-    const m = 10000;
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
     const o = 1000;
 
     var timer = try std.time.Timer.start();
@@ -147,8 +147,8 @@ fn fuzz8() !void {
     var pool = try BlockPool.init(std.heap.page_allocator);
     defer pool.deinit();
 
-    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072 };
-    const m = 10000;
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
     const o = 1000;
 
     for (ns) |n| {
@@ -214,8 +214,8 @@ fn bench8() !void {
     var pool = try BlockPool.init(std.heap.page_allocator);
     defer pool.deinit();
 
-    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072 };
-    const m = 10000;
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
     const o = 1000;
 
     var timer = try std.time.Timer.start();
