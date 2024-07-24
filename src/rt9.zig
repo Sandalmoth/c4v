@@ -1,10 +1,9 @@
 const std = @import("std");
 const BlockPool = @import("blockpool.zig").BlockPool(.{});
 
-const GC = @import("gc8.zig").GC;
-const Kind = @import("gc8.zig").Kind;
-const Object = @import("gc8.zig").Object;
-const NILHASH = @import("gc8.zig").NILHASH;
+const GC = @import("gc9.zig").GC;
+const Kind = @import("gc9.zig").Kind;
+const Object = @import("gc9.zig").Object;
 
 pub const RT = struct {
     gc: GC,
@@ -47,20 +46,57 @@ pub const RT = struct {
         return rt.gc.commit(.string, obj);
     }
 
+    const ChampKeyContext = struct {
+        objkey: ?*Object,
+        keyhash: u64,
+        depth: usize,
+
+        fn init(objkey: ?*Object) ChampKeyContext {
+            return .{
+                .objkey = objkey,
+                .keyhash = Object.hash(objkey, 0),
+                .depth = 0,
+            };
+        }
+
+        fn initDepth(objkey: ?*Object, depth: usize) ChampKeyContext {
+            return .{
+                .objkey = objkey,
+                .keyhash = Object.hash(objkey, depth / 10),
+                .depth = depth,
+            };
+        }
+
+        fn next(old: ChampKeyContext) ChampKeyContext {
+            var new = ChampKeyContext{
+                .objkey = old.objkey,
+                .keyhash = old.keyhash,
+                .depth = old.depth + 1,
+            };
+            if (old.depth / 10 < new.depth / 10) {
+                new.keyhash = Object.hash(new.objkey, new.depth / 10);
+            }
+            return new;
+        }
+
+        fn slot(ctx: ChampKeyContext) usize {
+            return (ctx.keyhash >> @intCast((ctx.depth % 10) * 6)) & 0b11_1111;
+        }
+    };
+
     pub fn champAssoc(rt: *RT, objchamp: ?*Object, objkey: ?*Object, objval: ?*Object) *Object {
         // inserting into nil just creates a new map
         const obj = objchamp orelse rt.newChamp();
-        return rt._champAssocImpl(obj, objkey, objval, 0);
+        return rt._champAssocImpl(obj, ChampKeyContext.init(objkey), objval);
     }
     fn _champAssocImpl(
         rt: *RT,
         objchamp: *Object,
-        objkey: ?*Object,
+        keyctx: ChampKeyContext,
         objval: ?*Object,
-        depth: usize,
     ) *Object {
         const champ = objchamp.as(.champ);
-        const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
+        const slot = keyctx.slot();
         const slotmask = @as(u64, 1) << @intCast(slot);
         const is_data = champ.datamask & slotmask > 0;
         const is_node = champ.nodemask & slotmask > 0;
@@ -78,9 +114,8 @@ pub const RT = struct {
             @memcpy(new.data()[0..], champ.data()[0 .. 2 * champ.datalen + champ.nodelen]);
             new.nodes()[packed_index] = rt._champAssocImpl(
                 champ.nodes()[packed_index],
-                objkey,
+                keyctx.next(),
                 objval,
-                depth + 1,
             );
             return rt.gc.commit(.champ, new);
         }
@@ -97,7 +132,7 @@ pub const RT = struct {
             const newdata = new.data();
             const olddata = champ.data();
             @memcpy(newdata[0..], olddata[0 .. 2 * packed_index]);
-            newdata[2 * packed_index] = objkey;
+            newdata[2 * packed_index] = keyctx.objkey;
             newdata[2 * packed_index + 1] = objval;
             @memcpy(
                 newdata[2 * packed_index + 2 ..],
@@ -107,7 +142,7 @@ pub const RT = struct {
         }
 
         const packed_index = @popCount(champ.datamask & (slotmask - 1));
-        if (rt.eql(champ.data()[2 * packed_index], objkey)) {
+        if (rt.eql(champ.data()[2 * packed_index], keyctx.objkey)) {
             // key already present, just update
             const new = rt.gc.alloc(.champ, 2 * champ.datalen + champ.nodelen) catch
                 @panic("GC allocation failure");
@@ -125,7 +160,8 @@ pub const RT = struct {
         const packed_node_index = @popCount(champ.nodemask & (slotmask - 1));
         const subkey = champ.data()[2 * packed_data_index];
         const subval = champ.data()[2 * packed_data_index + 1];
-        const subslot = if (subkey) |k| k.getHashAtDepth(depth + 1) else NILHASH & 0b11_1111;
+        const subctx = ChampKeyContext.initDepth(subkey, keyctx.depth + 1);
+        const subslot = subctx.slot();
         const sub = rt.gc.alloc(.champ, 2) catch @panic("GC allocation failure");
         sub.datamask = @as(u64, 1) << @intCast(subslot);
         sub.nodemask = 0;
@@ -154,9 +190,8 @@ pub const RT = struct {
         @memcpy(newnodes[0..], oldnodes[0..packed_node_index]);
         newnodes[packed_node_index] = rt._champAssocImpl(
             rt.gc.commit(.champ, sub),
-            objkey,
+            keyctx.next(),
             objval,
-            depth + 1,
         );
         @memcpy(newnodes[packed_node_index + 1 ..], oldnodes[packed_node_index..champ.nodelen]);
 
@@ -165,11 +200,11 @@ pub const RT = struct {
 
     pub fn champGet(rt: *RT, objchamp: ?*Object, objkey: ?*Object) ?*Object {
         const obj = objchamp orelse return null;
-        return rt._champGetImpl(obj, objkey, 0);
+        return rt._champGetImpl(obj, ChampKeyContext.init(objkey));
     }
-    fn _champGetImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) ?*Object {
+    fn _champGetImpl(rt: *RT, objchamp: *Object, keyctx: ChampKeyContext) ?*Object {
         const champ = objchamp.as(.champ);
-        const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
+        const slot = keyctx.slot();
         const slotmask = @as(u64, 1) << @intCast(slot);
         const is_data = champ.datamask & slotmask > 0;
         const is_node = champ.nodemask & slotmask > 0;
@@ -178,10 +213,10 @@ pub const RT = struct {
         if (!(is_node or is_data)) return null;
         if (is_node) {
             const packed_index = @popCount(champ.nodemask & (slotmask - 1));
-            return rt._champGetImpl(champ.nodes()[packed_index], objkey, depth + 1);
+            return rt._champGetImpl(champ.nodes()[packed_index], keyctx.next());
         }
         const packed_index = @popCount(champ.datamask & (slotmask - 1));
-        if (rt.eql(champ.data()[2 * packed_index], objkey)) {
+        if (rt.eql(champ.data()[2 * packed_index], keyctx.objkey)) {
             return champ.data()[2 * packed_index + 1];
         }
         return null;
@@ -189,16 +224,16 @@ pub const RT = struct {
 
     pub fn champContains(rt: *RT, objchamp: ?*Object, objkey: ?*Object) bool {
         const obj = objchamp orelse return false;
-        return rt._champGetImpl(obj, objkey, 0) != null;
+        return rt._champGetImpl(obj, ChampKeyContext.init(objkey)) != null;
     }
 
     pub fn champDissoc(rt: *RT, objchamp: ?*Object, objkey: ?*Object) ?*Object {
         const obj = objchamp orelse return null;
-        return rt._champDissocImpl(obj, objkey, 0);
+        return rt._champDissocImpl(obj, ChampKeyContext.init(objkey));
     }
-    fn _champDissocImpl(rt: *RT, objchamp: *Object, objkey: ?*Object, depth: usize) *Object {
+    fn _champDissocImpl(rt: *RT, objchamp: *Object, keyctx: ChampKeyContext) *Object {
         const champ = objchamp.as(.champ);
-        const slot = if (objkey) |k| k.getHashAtDepth(depth) else NILHASH & 0b11_1111;
+        const slot = keyctx.slot();
         const slotmask = @as(u64, 1) << @intCast(slot);
         const is_data = champ.datamask & slotmask > 0;
         const is_node = champ.nodemask & slotmask > 0;
@@ -208,7 +243,7 @@ pub const RT = struct {
 
         if (is_data) {
             const packed_index = @popCount(champ.datamask & (slotmask - 1));
-            if (!rt.eql(champ.data()[2 * packed_index], objkey)) return objchamp;
+            if (!rt.eql(champ.data()[2 * packed_index], keyctx.objkey)) return objchamp;
             if (champ.datalen + champ.nodelen == 1) return rt.newChamp();
             const new = rt.gc.alloc(.champ, 2 * (champ.datalen - 1) + champ.nodelen) catch
                 @panic("GC allocation failure");
@@ -227,7 +262,7 @@ pub const RT = struct {
         }
 
         const packed_index = @popCount(champ.nodemask & (slotmask - 1));
-        const objresult = rt._champDissocImpl(champ.nodes()[packed_index], objkey, depth + 1);
+        const objresult = rt._champDissocImpl(champ.nodes()[packed_index], keyctx.next());
         if (rt.eql(champ.nodes()[packed_index], objresult)) return objchamp;
 
         const result = objresult.as(.champ);
@@ -288,9 +323,8 @@ pub const RT = struct {
     pub fn eql(rt: *RT, obj1: ?*Object, obj2: ?*Object) bool {
         if (obj1 == obj2) return true;
         if (obj1 == null or obj2 == null) return false;
-        if (obj1.?._property != obj2.?._property) return false;
-        // NOTE _property equality implies both kind and hash are equal
-        return switch (obj1.?.getKind()) {
+        if (obj1.?.kind != obj2.?.kind) return false;
+        return switch (obj1.?.kind) {
             .real => obj1.?.as(.real).data == obj2.?.as(.real).data,
             .cons => blk: {
                 const cons1 = obj1.?.as(.cons);
@@ -337,7 +371,7 @@ pub fn debugPrint(obj: ?*Object) void {
 
 fn _printImpl(_obj: ?*Object, writer: anytype) anyerror!void {
     const obj = _obj orelse return writer.print("nil", .{});
-    switch (obj.getKind()) {
+    switch (obj.kind) {
         .real => try writer.print("{d}", .{obj.as(.real).data}),
         .cons => {
             var cons = obj.as(.cons);
@@ -346,7 +380,7 @@ fn _printImpl(_obj: ?*Object, writer: anytype) anyerror!void {
                 try _printImpl(cons.car, writer);
                 if (cons.cdr == null) {
                     break;
-                } else if (cons.cdr.?.getKind() != .cons) {
+                } else if (cons.cdr.?.kind != .cons) {
                     try writer.print(" . ", .{});
                     try _printImpl(cons.cdr, writer);
                     break;
