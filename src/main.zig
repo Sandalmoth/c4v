@@ -9,6 +9,9 @@ const debugPrint8 = @import("rt8.zig").debugPrint;
 
 pub fn main() !void {
     try scratch();
+    std.debug.print("hashmap\n", .{});
+    try benchHM();
+    try benchLookupHM();
     std.debug.print("hamt-based\n", .{});
     try fuzz7();
     try bench7();
@@ -149,6 +152,44 @@ fn fuzz8() !void {
     }
 }
 
+fn benchHM() !void {
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
+
+    var timer = try std.time.Timer.start();
+
+    for (ns) |n| {
+        var h = std.AutoHashMap(u32, u32).init(alloc);
+        defer h.deinit();
+
+        timer.reset();
+        for (0..m) |_| {
+            const x = rand.intRangeLessThan(u32, 0, n);
+            const y = rand.intRangeLessThan(u32, 0, n);
+            if (h.contains(x)) {
+                try h.put(x, y);
+            } else {
+                _ = h.remove(x);
+            }
+            const u = rand.intRangeLessThan(u32, 0, n);
+            const v = rand.intRangeLessThan(u32, 0, n);
+            if (rand.boolean()) {
+                try h.put(u, v);
+            } else {
+                _ = h.remove(v);
+            }
+        }
+        const ttot = timer.read();
+
+        std.debug.print("{}\t{}\n", .{ n, ttot / m });
+    }
+}
+
 fn bench7() !void {
     var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
     var rand = rng.random();
@@ -258,6 +299,46 @@ fn bench8() !void {
 
         std.debug.print("{}\t{}\t{}\n", .{ n, (ttot - tgc) / m, tgc / m });
     }
+}
+
+fn benchLookupHM() !void {
+    var rng = std.rand.DefaultPrng.init(@bitCast(std.time.microTimestamp()));
+    var rand = rng.random();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const alloc = gpa.allocator();
+
+    const ns = [_]u32{ 32, 128, 512, 2048, 8192, 32768, 131072, 524288 };
+    const m = 100000;
+
+    var timer = try std.time.Timer.start();
+    var acc: usize = 0;
+
+    for (ns) |n| {
+        var h = std.AutoHashMap(u32, u32).init(alloc);
+
+        for (0..n) |_| {
+            const x = rand.intRangeLessThan(u32, 0, n);
+            const y = rand.intRangeLessThan(u32, 0, n);
+            try h.put(x, y);
+        }
+
+        timer.reset();
+        for (0..m) |_| {
+            const x = rand.intRangeLessThan(u32, 0, n);
+            if (h.contains(x)) acc += 1;
+        }
+        const t1 = timer.read();
+
+        timer.reset();
+        for (0..m) |_| {
+            const x = rand.intRangeLessThan(u32, 0, n);
+            if (h.contains(x)) acc += 1;
+        }
+        const t2 = timer.read();
+
+        std.debug.print("{}\t{}\t{}\n", .{ n, t1 / m, t2 / m });
+    }
+    std.debug.print("{}\n", .{acc});
 }
 
 fn benchLookup7() !void {
